@@ -9,7 +9,9 @@ import numpy as np
 
 from brillouin_system.devices.cameras.andor.andor_dataclasses import AndorCameraInfo
 from brillouin_system.guis.human_interface.scan_procedures import (
+    RANDOM_SCAN_BACKLASH_PRELOAD_UM,
     perform_calibration,
+    random_scan_targets,
     take_axial_step_scan,
 )
 from brillouin_system.my_dataclasses.request_axial_step_scan import RequestAxialStepScan
@@ -154,6 +156,35 @@ def test_sample_scan_steps_the_lens_and_returns_to_start():
     # Lens went back to the starting position at the end.
     assert backend.returned_to == [9000.0]
     assert backend.zaber_eye_lens.position == 9000.0
+
+
+def test_random_scan_visits_the_step_scan_positions_in_shuffled_order():
+    backend = FakeBackend(is_reference_mode=False)
+    ok = take_axial_step_scan(backend, RequestAxialStepScan(
+        id="random", n_measurements=8, step_size_um=10.0,
+        randomize_order=True, random_seed=3))
+
+    assert ok
+    positions = [m.lens_zaber_position for m in backend.registered[0].measurements]
+    # Same set of positions as the ordinary step scan, not in ascending order.
+    assert sorted(positions) == [9000.0 + 10.0 * (k + 1) for k in range(8)]
+    assert positions != sorted(positions)
+    assert positions == random_scan_targets(9000.0, 10.0, 8, seed=3)
+    assert backend.emitted_lens_positions == positions
+    assert backend.zaber_eye_lens.position == 9000.0
+
+
+def test_random_scan_approaches_every_target_from_below():
+    backend = FakeBackend(is_reference_mode=False)
+    take_axial_step_scan(backend, RequestAxialStepScan(
+        id="random", n_measurements=6, step_size_um=10.0,
+        randomize_order=True, random_seed=1))
+
+    moves = backend.zaber_eye_lens.moves[:-1]      # last move = return to start
+    assert all(kind == "abs" for kind, _ in moves)
+    # Moves come in pairs: preload position, then the target 100 µm above it.
+    for (_, preload), (_, target) in zip(moves[0::2], moves[1::2]):
+        assert target - preload == RANDOM_SCAN_BACKLASH_PRELOAD_UM
 
 
 def test_cancellation_registers_nothing_and_returns_the_lens():

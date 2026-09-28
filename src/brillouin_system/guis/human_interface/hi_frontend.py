@@ -790,6 +790,16 @@ class HiFrontend(QWidget):
         self.axial_btn = QPushButton("Scan")
         self.axial_btn.clicked.connect(lambda: self.take_axial_step_scan(find_reflection_plane=False))
 
+        self.axial_random_btn = QPushButton("Random Scan")
+        self.axial_random_btn.setToolTip(
+            "Same positions as Scan (current position + k x Step Size, "
+            "k = 1..Num Meas), visited in shuffled order. Each position is "
+            "approached from 100 µm below so backlash is always taken up the "
+            "same way. Frames are stored in acquisition order with their lens "
+            "positions; the seed is written to the log.")
+        self.axial_random_btn.clicked.connect(
+            lambda: self.take_axial_step_scan(find_reflection_plane=False, randomize_order=True))
+
         self.axial_btn2 = QPushButton("Find -> Scan")
         self.axial_btn2.clicked.connect(lambda: self.take_axial_step_scan(find_reflection_plane=True))
 
@@ -805,6 +815,7 @@ class HiFrontend(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.axial_btn)
+        btn_row.addWidget(self.axial_random_btn)
         btn_row.addWidget(self.axial_btn2)
         btn_row.addWidget(self.take_background_btn)
         btn_row.addStretch()
@@ -2191,7 +2202,7 @@ class HiFrontend(QWidget):
     def update_laser_coord_calibration(self, laser_offset: LaserOffset):
         self._laser_offset: LaserOffset = laser_offset
 
-    def take_axial_step_scan(self, find_reflection_plane: bool = False):
+    def take_axial_step_scan(self, find_reflection_plane: bool = False, randomize_order: bool = False):
         try:
             id_str = self.axial_id_input.text().strip()
             n_meas = int(self.axial_num_input.text())
@@ -2199,7 +2210,8 @@ class HiFrontend(QWidget):
 
             # Log info
             log.info(
-                f"[Brillouin Viewer] Axial Scan Request | ID: {id_str}, N: {n_meas}, Step: {step} µm")
+                f"[Brillouin Viewer] Axial Scan Request | ID: {id_str}, N: {n_meas}, Step: {step} µm"
+                f"{', random order' if randomize_order else ''}")
 
 
             request = RequestAxialStepScan(
@@ -2208,6 +2220,7 @@ class HiFrontend(QWidget):
                 step_size_um=step,
                 find_reflection_plane=find_reflection_plane,
                 eye_tracker_results=self.lastest_eye_tracker_results,
+                randomize_order=randomize_order,
             )
 
             self.take_axial_step_scan_requested.emit(request)

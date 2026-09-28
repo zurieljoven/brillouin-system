@@ -8,6 +8,7 @@ the lens, find the reflection plane) — the same split as the analysis
 side, where fit_axial_scan drives the fitter instead of living in it.
 """
 import itertools
+import random
 import time
 
 from brillouin_system.calibration.calibration import (
@@ -32,6 +33,19 @@ from brillouin_system.my_dataclasses.sweep_cycle import SweepCycle
 from brillouin_system.scan_managers.ni_reflection_finder4 import ReflectionResult
 
 log = get_logger(__name__)
+
+# Random-order scans reverse direction between frames; every target is
+# approached from this far below so the final move is always forward (+z),
+# as in scan_managers.reflection_error_characterization.
+RANDOM_SCAN_BACKLASH_PRELOAD_UM = 100.0
+
+
+def random_scan_targets(start_um: float, step_um: float, n: int,
+                        seed: int) -> list[float]:
+    """The ordinary step scan's targets (start + k*step, k = 1..n), shuffled."""
+    targets = [start_um + step_um * (k + 1) for k in range(n)]
+    random.Random(seed).shuffle(targets)
+    return targets
 
 
 def take_axial_step_scan(backend, request_axial_scan: RequestAxialStepScan) -> bool:
@@ -79,6 +93,16 @@ def take_axial_step_scan(backend, request_axial_scan: RequestAxialStepScan) -> b
                 backend.zaber_eye_lens.move_abs(lens_x0)
                 return False
 
+        targets = None
+        if request_axial_scan.randomize_order:
+            seed = request_axial_scan.random_seed
+            if seed is None:
+                seed = random.SystemRandom().randrange(2 ** 32)
+            targets = random_scan_targets(backend.zaber_eye_lens.get_position(), dx,
+                                          request_axial_scan.n_measurements, seed)
+            log.info(f"[Axial Scan] Random order, seed {seed}, backlash preload "
+                     f"{RANDOM_SCAN_BACKLASH_PRELOAD_UM:.0f} µm")
+
         for i in range(request_axial_scan.n_measurements):
             if backend.f2b_cancel_callback():
                 log.info(f"[Axial Scan] Cancelled during step {i + 1}. "
@@ -87,7 +111,11 @@ def take_axial_step_scan(backend, request_axial_scan: RequestAxialStepScan) -> b
                 return False
 
             log.info(f"[Axial Scan] Frame {i + 1}/{request_axial_scan.n_measurements}")
-            backend.zaber_eye_lens.move_rel(delta_um=dx)
+            if targets is None:
+                backend.zaber_eye_lens.move_rel(delta_um=dx)
+            else:
+                backend.zaber_eye_lens.move_abs(targets[i] - RANDOM_SCAN_BACKLASH_PRELOAD_UM)
+                backend.zaber_eye_lens.move_abs(targets[i])
             zaber_pos = backend.zaber_eye_lens.get_position()
             backend.b2f_emit_update_zaber_lens_position(zaber_pos)
 
