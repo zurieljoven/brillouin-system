@@ -9,12 +9,15 @@ import numpy as np
 
 from brillouin_system.devices.cameras.andor.andor_dataclasses import AndorCameraInfo
 from brillouin_system.guis.human_interface.scan_procedures import (
-    RANDOM_SCAN_BACKLASH_PRELOAD_UM,
+    AXIAL_SCAN_BACKLASH_PRELOAD_UM,
+    adaptive_scan_targets,
     perform_calibration,
     random_scan_targets,
     take_axial_step_scan,
 )
-from brillouin_system.my_dataclasses.request_axial_step_scan import RequestAxialStepScan
+import pytest
+
+from brillouin_system.my_dataclasses.request_axial_step_scan import AdaptiveScanParams, RequestAxialStepScan
 from brillouin_system.my_dataclasses.system_state import SystemState
 
 
@@ -184,7 +187,53 @@ def test_random_scan_approaches_every_target_from_below():
     assert all(kind == "abs" for kind, _ in moves)
     # Moves come in pairs: preload position, then the target 100 µm above it.
     for (_, preload), (_, target) in zip(moves[0::2], moves[1::2]):
-        assert target - preload == RANDOM_SCAN_BACKLASH_PRELOAD_UM
+        assert target - preload == AXIAL_SCAN_BACKLASH_PRELOAD_UM
+
+
+def test_adaptive_targets_fine_centre_and_growing_steps_to_the_range_ends():
+    z = adaptive_scan_targets(1000.0, n_total=101, total_range_um=100.0, min_step_um=0.2, n_fine=41)
+    steps = np.diff(z)
+    assert len(z) == 101
+    assert z[0] == pytest.approx(950.0) and z[-1] == pytest.approx(1050.0)
+    assert np.all(steps > 0)
+    # 41 fine frames at the smallest step, centred on 1000 µm.
+    centre = int(np.argmin(np.abs(np.array(z) - 1000.0)))
+    assert z[centre] == pytest.approx(1000.0)
+    assert np.allclose(steps[centre - 20:centre + 20], 0.2)
+    # Steps never shrink going outwards on either side, and the largest are at the ends.
+    right, left = steps[centre + 20:], steps[:centre - 20][::-1]
+    assert np.all(np.diff(right) >= -1e-12) and np.all(np.diff(left) >= -1e-12)
+    assert steps.max() == pytest.approx(max(steps[0], steps[-1]))
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(n_total=100, total_range_um=10.0, min_step_um=0.2, n_fine=80),   # fine core wider than the range
+    dict(n_total=600, total_range_um=20.0, min_step_um=0.1, n_fine=50),   # too many wing frames
+    dict(n_total=10, total_range_um=20.0, min_step_um=0.1, n_fine=20),    # more fine than total frames
+])
+def test_adaptive_targets_refuse_impossible_inputs(kwargs):
+    with pytest.raises(ValueError):
+        adaptive_scan_targets(0.0, **kwargs)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_adaptive_sweep_is_monotonic_with_one_preload_on_the_incoming_side(reverse):
+    backend = FakeBackend(is_reference_mode=False)
+    ok = take_axial_step_scan(backend, RequestAxialStepScan(
+        id="adaptive", n_measurements=21, step_size_um=0.5,
+        adaptive=AdaptiveScanParams(total_range_um=40.0, min_step_um=0.5, n_fine=9, reverse=reverse)))
+
+    assert ok
+    positions = [m.lens_zaber_position for m in backend.registered[0].measurements]
+    expected = adaptive_scan_targets(9000.0, 21, 40.0, 0.5, 9)
+    assert positions == (expected[::-1] if reverse else expected)
+    # One preload move beyond the first target (below forward, above reverse),
+    # then exactly one move per frame, then the return to the start.
+    moves = [z for _, z in backend.zaber_eye_lens.moves]
+    sign = 1.0 if reverse else -1.0
+    assert moves[0] == pytest.approx(positions[0] + sign * AXIAL_SCAN_BACKLASH_PRELOAD_UM)
+    assert moves[1:-1] == positions
+    assert backend.zaber_eye_lens.position == 9000.0
 
 
 def test_cancellation_registers_nothing_and_returns_the_lens():

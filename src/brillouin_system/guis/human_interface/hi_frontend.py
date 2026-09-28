@@ -61,7 +61,8 @@ from brillouin_system.guis.human_interface.predefined_plan import (
     parse_plan_toml,
 )
 from brillouin_system.my_dataclasses.axial_scan import AxialScan
-from brillouin_system.my_dataclasses.request_axial_step_scan import RequestAxialStepScan
+from brillouin_system.my_dataclasses.request_axial_step_scan import AdaptiveScanParams, RequestAxialStepScan
+from brillouin_system.guis.human_interface.scan_procedures import adaptive_scan_targets
 from brillouin_system.my_dataclasses.request_sweep_scan import RequestSweepScan
 from brillouin_system.calibration.calibration import CalibrationData, CalibrationCalculator
 from brillouin_system.calibration.calibration_plotting import render_calibration_to_pixmap, CalibrationImageDialog
@@ -821,6 +822,45 @@ class HiFrontend(QWidget):
         btn_row.addStretch()
 
         layout.addRow(btn_row)
+
+        # --- Adaptive sweep: fine steps in the centre, coarser outwards ---
+        # Total frames = Num Meas above; centred on the current lens position;
+        # one forward (+z) sweep (e.g. mirror reflection sweeps).
+        self.adaptive_range_input = QLineEdit("120")
+        self.adaptive_range_input.setFixedWidth(80)
+        self.adaptive_min_step_input = QLineEdit("0.1")
+        self.adaptive_min_step_input.setFixedWidth(80)
+        self.adaptive_n_fine_input = QLineEdit("200")
+        self.adaptive_n_fine_input.setFixedWidth(80)
+        self.adaptive_info_label = QLabel("")
+        for w in (self.adaptive_range_input, self.adaptive_min_step_input,
+                  self.adaptive_n_fine_input, self.axial_num_input):
+            w.textChanged.connect(self.update_adaptive_scan_info)
+
+        self.adaptive_reverse_checkbox = QCheckBox("Reverse (-z)")
+        self.adaptive_reverse_checkbox.setToolTip(
+            "Sweep from +Range/2 down to -Range/2 instead of upwards.")
+
+        self.adaptive_scan_btn = QPushButton("Adaptive Sweep")
+        self.adaptive_scan_btn.setToolTip(
+            "One-direction sweep centred on the CURRENT lens position over "
+            "Range, Num Meas frames in total: N Fine frames at Min Step in the "
+            "centre, the step growing linearly outwards so the sweep ends at "
+            "+-Range/2. Forward (+z) unless Reverse is ticked. The first "
+            "position is approached from 100 µm beyond it, on the side the "
+            "sweep comes from, to take up backlash.")
+        self.adaptive_scan_btn.clicked.connect(self.take_adaptive_scan)
+
+        layout.addRow("Adaptive Range (µm):", self.adaptive_range_input)
+        layout.addRow("Adaptive Min Step (µm):", self.adaptive_min_step_input)
+        layout.addRow("Adaptive N Fine:", self.adaptive_n_fine_input)
+        adaptive_row = QHBoxLayout()
+        adaptive_row.addWidget(self.adaptive_scan_btn)
+        adaptive_row.addWidget(self.adaptive_reverse_checkbox)
+        adaptive_row.addWidget(self.adaptive_info_label)
+        adaptive_row.addStretch()
+        layout.addRow(adaptive_row)
+        self.update_adaptive_scan_info()
 
         # --- In-out sweep scan (repeated find-measure-find cycles) ---
         self.sweep_scan_btn = QPushButton("Sweep Scan")
@@ -2228,6 +2268,47 @@ class HiFrontend(QWidget):
         except Exception as e:
             log.exception(f"[Brillouin Viewer] Failed to initiate axial scan: {e}")
 
+
+    def _adaptive_scan_params(self) -> tuple[int, AdaptiveScanParams]:
+        return int(self.axial_num_input.text()), AdaptiveScanParams(
+            total_range_um=float(self.adaptive_range_input.text()),
+            min_step_um=float(self.adaptive_min_step_input.text()),
+            n_fine=int(self.adaptive_n_fine_input.text()),
+            reverse=self.adaptive_reverse_checkbox.isChecked())
+
+    def update_adaptive_scan_info(self):
+        """Show the largest step the adaptive sweep would use, or why it can't run."""
+        if not hasattr(self, "adaptive_info_label"):
+            return
+        try:
+            n, p = self._adaptive_scan_params()
+            z = adaptive_scan_targets(0.0, n, p.total_range_um, p.min_step_um, p.n_fine)
+            largest = max((b - a for a, b in zip(z, z[1:])), default=0.0)
+            self.adaptive_info_label.setText(f"largest step {largest:.3f} µm")
+        except ValueError as e:
+            self.adaptive_info_label.setText(f"invalid: {e}")
+
+    def take_adaptive_scan(self):
+        try:
+            n_meas, params = self._adaptive_scan_params()
+            # Validate before handing the request to the scan thread.
+            adaptive_scan_targets(0.0, n_meas, params.total_range_um, params.min_step_um, params.n_fine)
+            id_str = self.axial_id_input.text().strip()
+            log.info(f"[Brillouin Viewer] Adaptive Sweep Request | ID: {id_str}, N: {n_meas}, "
+                     f"range {params.total_range_um} µm, min step {params.min_step_um} µm, "
+                     f"{params.n_fine} fine frames, {'-z' if params.reverse else '+z'}")
+            self.take_axial_step_scan_requested.emit(RequestAxialStepScan(
+                id=id_str,
+                n_measurements=n_meas,
+                step_size_um=params.min_step_um,
+                find_reflection_plane=False,
+                eye_tracker_results=self.lastest_eye_tracker_results,
+                adaptive=params,
+            ))
+        except ValueError as e:
+            QMessageBox.warning(self, "Adaptive Sweep", f"Cannot run this sweep: {e}")
+        except Exception as e:
+            log.exception(f"[Brillouin Viewer] Failed to initiate adaptive sweep: {e}")
 
     def take_background_scan(self):
         """A reflection-background capture IS a normal axial scan: N frames

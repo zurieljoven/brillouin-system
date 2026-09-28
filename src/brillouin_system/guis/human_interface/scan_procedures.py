@@ -34,10 +34,11 @@ from brillouin_system.scan_managers.ni_reflection_finder4 import ReflectionResul
 
 log = get_logger(__name__)
 
-# Random-order scans reverse direction between frames; every target is
-# approached from this far below so the final move is always forward (+z),
-# as in scan_managers.reflection_error_characterization.
-RANDOM_SCAN_BACKLASH_PRELOAD_UM = 100.0
+# Absolute-target scans (random order, adaptive sweep) approach a target from
+# this far away, on the side they are coming from, so the final move always
+# runs in the scan direction and the lead-screw slack is taken up the same way
+# (as in scan_managers.reflection_error_characterization).
+AXIAL_SCAN_BACKLASH_PRELOAD_UM = 100.0
 
 
 def random_scan_targets(start_um: float, step_um: float, n: int,
@@ -46,6 +47,49 @@ def random_scan_targets(start_um: float, step_um: float, n: int,
     targets = [start_um + step_um * (k + 1) for k in range(n)]
     random.Random(seed).shuffle(targets)
     return targets
+
+
+def adaptive_scan_targets(center_um: float, n_total: int, total_range_um: float,
+                          min_step_um: float, n_fine: int) -> list[float]:
+    """Ascending positions of an adaptive sweep centred on center_um.
+
+    n_fine frames at min_step_um form the centre. The other n_total - n_fine
+    frames are split between the two wings; in each wing the step grows
+    linearly, s_k = min_step + k*delta (k = 1..m), with delta chosen so the
+    wing ends exactly at +-total_range_um/2. Raises ValueError when the inputs
+    cannot give that (fine core wider than the range, or so many wing frames
+    that the steps would have to shrink below min_step_um).
+    """
+    if n_total < 1 or not 1 <= n_fine <= n_total:
+        raise ValueError(f"need 1 <= fine frames ({n_fine}) <= total frames ({n_total})")
+    if min_step_um <= 0 or total_range_um <= 0:
+        raise ValueError("range and smallest step must be positive")
+    half = total_range_um / 2
+    core_half = (n_fine - 1) * min_step_um / 2
+    wing_um = half - core_half
+    if wing_um < -1e-9:
+        raise ValueError(f"fine region ({2 * core_half:.3f} µm) is wider than the range "
+                         f"({total_range_um:.3f} µm)")
+
+    def wing_offsets(m: int) -> list[float]:
+        if m == 0:
+            if wing_um > 1e-9:
+                raise ValueError("no frames left to reach the ends of the range; "
+                                 "add frames or reduce the fine frames")
+            return []
+        delta = (wing_um - m * min_step_um) / (m * (m + 1) / 2)
+        if delta < -1e-12:
+            raise ValueError(f"{m} wing frames at >= {min_step_um} µm overshoot the "
+                             f"{wing_um:.3f} µm wing; reduce the total frames or widen the range")
+        steps = [min_step_um + k * delta for k in range(1, m + 1)]
+        return list(itertools.accumulate(steps))
+
+    n_out = n_total - n_fine
+    left = wing_offsets(n_out // 2)
+    right = wing_offsets(n_out - n_out // 2)
+    core = [center_um + (j - (n_fine - 1) / 2) * min_step_um for j in range(n_fine)]
+    return ([core[0] - d for d in reversed(left)] + core
+            + [core[-1] + d for d in right])
 
 
 def take_axial_step_scan(backend, request_axial_scan: RequestAxialStepScan) -> bool:
@@ -93,15 +137,32 @@ def take_axial_step_scan(backend, request_axial_scan: RequestAxialStepScan) -> b
                 backend.zaber_eye_lens.move_abs(lens_x0)
                 return False
 
-        targets = None
-        if request_axial_scan.randomize_order:
+        # targets None = the ordinary relative steps. Otherwise absolute
+        # targets, each approached from the preload distance on the `approach`
+        # side (-1 = from below, final move +z; +1 = from above, final move -z):
+        # the random scan before every frame (always from below), the adaptive
+        # sweep only before its first frame (it then moves monotonically).
+        targets, approach, preload_every_frame = None, -1.0, False
+        if request_axial_scan.adaptive is not None:
+            ad = request_axial_scan.adaptive
+            targets = adaptive_scan_targets(
+                backend.zaber_eye_lens.get_position(), request_axial_scan.n_measurements,
+                ad.total_range_um, ad.min_step_um, ad.n_fine)
+            largest = max((b - a for a, b in zip(targets, targets[1:])), default=0.0)
+            if ad.reverse:
+                targets, approach = targets[::-1], 1.0
+            log.info(f"[Axial Scan] Adaptive sweep ({'-z' if ad.reverse else '+z'}): "
+                     f"{ad.n_fine} frames at {ad.min_step_um} µm in the centre, largest step "
+                     f"{largest:.3f} µm, range {ad.total_range_um} µm")
+        elif request_axial_scan.randomize_order:
+            preload_every_frame = True
             seed = request_axial_scan.random_seed
             if seed is None:
                 seed = random.SystemRandom().randrange(2 ** 32)
             targets = random_scan_targets(backend.zaber_eye_lens.get_position(), dx,
                                           request_axial_scan.n_measurements, seed)
             log.info(f"[Axial Scan] Random order, seed {seed}, backlash preload "
-                     f"{RANDOM_SCAN_BACKLASH_PRELOAD_UM:.0f} µm")
+                     f"{AXIAL_SCAN_BACKLASH_PRELOAD_UM:.0f} µm")
 
         for i in range(request_axial_scan.n_measurements):
             if backend.f2b_cancel_callback():
@@ -114,7 +175,8 @@ def take_axial_step_scan(backend, request_axial_scan: RequestAxialStepScan) -> b
             if targets is None:
                 backend.zaber_eye_lens.move_rel(delta_um=dx)
             else:
-                backend.zaber_eye_lens.move_abs(targets[i] - RANDOM_SCAN_BACKLASH_PRELOAD_UM)
+                if preload_every_frame or i == 0:
+                    backend.zaber_eye_lens.move_abs(targets[i] + approach * AXIAL_SCAN_BACKLASH_PRELOAD_UM)
                 backend.zaber_eye_lens.move_abs(targets[i])
             zaber_pos = backend.zaber_eye_lens.get_position()
             backend.b2f_emit_update_zaber_lens_position(zaber_pos)
