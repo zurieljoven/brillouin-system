@@ -94,6 +94,16 @@ class EyeTrackerConfigDialog(QDialog):
         inputs["fill_n_vetical_dark_pixels_right"] = le_fill_right
         add_row("Fill N vertical dark pixels (right)", le_fill_right)
 
+        le_hfill_left = QLineEdit()
+        le_hfill_left.setValidator(QIntValidator(0, 10000))
+        inputs["fill_n_horizontal_dark_pixels_left"] = le_hfill_left
+        add_row("Fill N horizontal dark pixels (left)", le_hfill_left)
+
+        le_hfill_right = QLineEdit()
+        le_hfill_right.setValidator(QIntValidator(0, 10000))
+        inputs["fill_n_horizontal_dark_pixels_right"] = le_hfill_right
+        add_row("Fill N horizontal dark pixels (right)", le_hfill_right)
+
         # Masking radii
         le_mask_left = QLineEdit()
         le_mask_left.setValidator(QIntValidator(1, 10000))
@@ -188,6 +198,12 @@ class EyeTrackerConfigDialog(QDialog):
         self.inputs["fill_n_vetical_dark_pixels_right"].setText(
             str(cfg.fill_n_vetical_dark_pixels_right)
         )
+        self.inputs["fill_n_horizontal_dark_pixels_left"].setText(
+            str(cfg.fill_n_horizontal_dark_pixels_left)
+        )
+        self.inputs["fill_n_horizontal_dark_pixels_right"].setText(
+            str(cfg.fill_n_horizontal_dark_pixels_right)
+        )
 
         # Masking
         self.inputs["masking_radius_left"].setText(str(cfg.masking_radius_left))
@@ -225,6 +241,8 @@ class EyeTrackerConfigDialog(QDialog):
             # NEW: fill defaults
             "fill_n_vetical_dark_pixels_left": _intval("fill_n_vetical_dark_pixels_left", 10),
             "fill_n_vetical_dark_pixels_right": _intval("fill_n_vetical_dark_pixels_right", 10),
+            "fill_n_horizontal_dark_pixels_left": _intval("fill_n_horizontal_dark_pixels_left", 0),
+            "fill_n_horizontal_dark_pixels_right": _intval("fill_n_horizontal_dark_pixels_right", 0),
 
             "masking_radius_left": _intval("masking_radius_left", 500),
             "masking_radius_right": _intval("masking_radius_right", 500),

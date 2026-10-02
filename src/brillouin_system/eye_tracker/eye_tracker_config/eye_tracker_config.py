@@ -27,6 +27,10 @@ class EyeTrackerConfig:
     fill_n_vetical_dark_pixels_left: int = 10
     fill_n_vetical_dark_pixels_right: int = 10
 
+    # Fill N horizontal dark pixels (0 = off)
+    fill_n_horizontal_dark_pixels_left: int = 0
+    fill_n_horizontal_dark_pixels_right: int = 0
+
     # Masking
     masking_radius_left: int = 500
     masking_radius_right: int = 500

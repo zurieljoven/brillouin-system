@@ -35,6 +35,8 @@ class EllipseFitter:
         self._masking_radius_right: int = 500
         self._fill_n_vetical_dark_pixels_left: int = 0
         self._fill_n_vetical_dark_pixels_right: int = 0
+        self._fill_n_horizontal_dark_pixels_left: int = 0
+        self._fill_n_horizontal_dark_pixels_right: int = 0
         self._masking_center_left: tuple[int, int] = (0, 0)
         self._masking_center_right: tuple[int, int] = (0, 0)
         self._frame_to_be_returned: PupilImgType = PupilImgType.ORIGINAL
@@ -49,7 +51,9 @@ class EllipseFitter:
             masking_radius_right: int,
             masking_center_left: tuple[int, int],
             masking_center_right: tuple[int, int],
-            frame_to_be_returned: str
+            frame_to_be_returned: str,
+            fill_n_horizontal_dark_pixels_left: int = 0,
+            fill_n_horizontal_dark_pixels_right: int = 0,
     ) -> None:
         """
         Directly sets all internal configuration fields.
@@ -62,6 +66,8 @@ class EllipseFitter:
 
         self._fill_n_vetical_dark_pixels_left = fill_n_vetical_dark_pixels_left
         self._fill_n_vetical_dark_pixels_right = fill_n_vetical_dark_pixels_right
+        self._fill_n_horizontal_dark_pixels_left = fill_n_horizontal_dark_pixels_left
+        self._fill_n_horizontal_dark_pixels_right = fill_n_horizontal_dark_pixels_right
 
         self._masking_radius_left = masking_radius_left
         self._masking_radius_right = masking_radius_right
@@ -85,6 +91,7 @@ class EllipseFitter:
         return find_pupil_ellipse_with_flooding(img=image,
                                                 threshold=self._binary_threshold_left,
                                                 fill_n_vetical_dark_pixels=self._fill_n_vetical_dark_pixels_left,
+                                                fill_n_horizontal_dark_pixels=self._fill_n_horizontal_dark_pixels_left,
                                                 frame_to_be_returned=self._frame_to_be_returned)
 
 
@@ -100,5 +107,6 @@ class EllipseFitter:
         return find_pupil_ellipse_with_flooding(img=image,
                                                 threshold=self._binary_threshold_right,
                                                 fill_n_vetical_dark_pixels=self._fill_n_vetical_dark_pixels_right,
+                                                fill_n_horizontal_dark_pixels=self._fill_n_horizontal_dark_pixels_right,
                                                 frame_to_be_returned=self._frame_to_be_returned)
 
