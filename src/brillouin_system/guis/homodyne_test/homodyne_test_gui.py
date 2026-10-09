@@ -43,7 +43,8 @@ from PyQt5.QtWidgets import (
 
 from brillouin_system.devices.ni.ni6008_multi import DIFF_RANGES_V, effective_range_v
 from brillouin_system.guis.homodyne_test.experiment_plan import (
-    MAX_XY_MOVE_UM, ExperimentStep, build_experiment_steps, radii_range, xy_stage_move_um, z_lens_move_um,
+    MAX_XY_MOVE_UM, ExperimentStep, build_experiment_steps, build_repeat_steps, radii_range, xy_stage_move_um,
+    z_lens_move_um,
 )
 from brillouin_system.scan_managers.homodyne_processing import (
     fringe_band_hz, fringe_frequency_hz, locate_peak, process_channels,
@@ -87,6 +88,7 @@ class _ExperimentState:
     plan: dict
     steps: list
     run_dir: Path
+    use_eye: bool = True        # False: repeat run, no eye-tracking moves
     i: int = 0                  # index of the current step
     phase: str = ""             # "xy_move" | "z_move" | "slew"
     xy_moves: int = 0
@@ -740,6 +742,28 @@ class HomodyneTestWindow(QWidget):
         cl.addWidget(g)
         self._exp_update_info()
 
+        # Repeat slews at a fixed position (e.g. water cuvette): no eye tracking
+        g = QGroupBox("Repeat slews (no eye tracking)")
+        f = QFormLayout(g)
+        self.rep_pairs = QSpinBox()
+        self.rep_pairs.setRange(1, 1000)
+        self.rep_pairs.setValue(50)
+        self.rep_info = QLabel()
+        self.rep_info.setWordWrap(True)
+        self.rep_btn = QPushButton("Start repeat slews")
+        self.rep_btn.clicked.connect(self._rep_start)
+        for wdg in (self.rep_pairs, self.exp_fwd_range, self.exp_bwd_range, self.speed):
+            wdg.valueChanged.connect(self._rep_update_info)
+        f.addRow("Fwd + bwd pairs:", self.rep_pairs)
+        f.addRow(QLabel("Alternates fwd, bwd, ... from the current lens z, using the Fwd/Bwd "
+                        "back-off and range above and the shutter options. Nothing else moves."))
+        f.addRow(self.rep_info)
+        f.addRow(self.rep_btn)
+        for lbl in g.findChildren(QLabel):
+            lbl.setWordWrap(True)
+        cl.addWidget(g)
+        self._rep_update_info()
+
         # Eye-tracker settings (thresholds/exposure for the fake eyes)
         g = QGroupBox("Eye tracker")
         v = QVBoxLayout(g)
@@ -833,6 +857,7 @@ class HomodyneTestWindow(QWidget):
         self.move_xyz_btn.setEnabled(idle and has_eye and has_stage)
         self.go_peak_btn.setEnabled(idle and self._last_peak_z is not None)
         self.exp_btn.setEnabled(idle and has_eye and has_stage)
+        self.rep_btn.setEnabled(idle)
 
     @pyqtSlot(str)
     def _set_status(self, text: str):
@@ -1001,14 +1026,20 @@ class HomodyneTestWindow(QWidget):
         except ValueError as e:
             QMessageBox.warning(self, "Experiment", str(e))
             return
-        if not self._confirm_discard_unsaved("start the experiment"):
+        self._exp_begin(plan, build_experiment_steps(plan["radii_mm"], plan["n_loops"]), "experiment",
+                        use_eye=True, description=self.exp_info.text(),
+                        motion="The rig stage and eye lens will move.")
+
+    def _exp_begin(self, plan: dict, steps: list, prefix: str, *, use_eye: bool,
+                   description: str, motion: str):
+        """Shared start for the eye-tracking experiment and the repeat run."""
+        if not self._confirm_discard_unsaved("start the run"):
             return
-        steps = build_experiment_steps(plan["radii_mm"], plan["n_loops"])
-        run_dir = Path(self.save_dir.text()) / f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_dir = Path(self.save_dir.text()) / f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         r = QMessageBox.question(
-            self, "Start experiment",
-            f"{self.exp_info.text()}\n\nThe rig stage and eye lens will move. Every slew is saved to\n"
-            f"{run_dir}\n\nStart?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            self, "Start automated run",
+            f"{description}\n\n{motion} Every slew is saved to\n{run_dir}\n\nStart?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if r != QMessageBox.Yes:
             return
         try:
@@ -1021,11 +1052,48 @@ class HomodyneTestWindow(QWidget):
             QMessageBox.warning(self, "Experiment", f"Cannot create the run folder: {e}")
             return
 
-        self._exp = _ExperimentState(plan=plan, steps=steps, run_dir=run_dir)
+        self._exp = _ExperimentState(plan=plan, steps=steps, run_dir=run_dir, use_eye=use_eye)
         self._set_busy(True)
         if self.exp_open_shutter.isChecked() and self.shutters is not None:
             self._open_sample_shutter()
         self._exp_next()
+
+    def _rep_plan(self) -> dict:
+        return {
+            "mode": "repeat",
+            "n_pairs": self.rep_pairs.value(),
+            "fwd_backoff_um": self.exp_fwd_backoff.value(),
+            "fwd_range_um": self.exp_fwd_range.value(),
+            "bwd_backoff_um": self.exp_bwd_backoff.value(),
+            "bwd_range_um": self.exp_bwd_range.value(),
+            "speed_um_s": self.speed.value(),
+        }
+
+    def _rep_update_info(self, *_):
+        p = self._rep_plan()
+        n = 2 * p["n_pairs"]
+        # slew time + ~4 s per slew for the back-off, settling and the return move
+        t = p["n_pairs"] * (p["fwd_range_um"] + p["bwd_range_um"]) / p["speed_um_s"] + 4.0 * n
+        self.rep_info.setText(f"{n} slews ({p['n_pairs']} each way), roughly {t / 60:.0f} min "
+                              f"at {p['speed_um_s']:.0f} um/s.")
+
+    def _rep_start(self):
+        if self._exp is not None:
+            return
+        if self._worker is None:
+            QMessageBox.warning(self, "Repeat slews", "Needs the eye lens and the DAQ.")
+            return
+        try:
+            plan = self._rep_plan()
+            self._daq_settings_validated()
+            fringe_band_hz(plan["speed_um_s"], self.wavelength.value(), float(self.fs.value()))
+        except ValueError as e:
+            QMessageBox.warning(self, "Repeat slews", str(e))
+            return
+        plan["start_lens_um"] = self._lens_um
+        self._exp_begin(plan, build_repeat_steps(plan["n_pairs"]), "repeat", use_eye=False,
+                        description=self.rep_info.text(),
+                        motion="Only the eye lens moves (slews return to the current z).")
 
     def _exp_log(self, step: ExperimentStep, status: str, file: str = "", peak=None):
         e = self._exp
@@ -1033,7 +1101,7 @@ class HomodyneTestWindow(QWidget):
         sx, sy, sz = self._stage_xyz if self._stage_xyz is not None else (None, None, None)
         row = {
             "step": e.i + 1, "loop": step.loop, "r_target_mm": step.r_mm,
-            "phi_target_deg": e.plan["phi_deg"], "direction": step.direction, "file": file, "status": status,
+            "phi_target_deg": e.plan.get("phi_deg"), "direction": step.direction, "file": file, "status": status,
             "laser_x_mm": snap.get("laser_x_mm"), "laser_y_mm": snap.get("laser_y_mm"),
             "xy_err_mm": snap.get("xy_err_mm"), "xy_moves": snap.get("xy_moves", e.xy_moves),
             "dc_mm": snap.get("dc_mm"), "lens_start_um": snap.get("lens_start_um"),
@@ -1056,12 +1124,17 @@ class HomodyneTestWindow(QWidget):
         e.xy_moves = 0
         e.snapshot = {}
         e.eye_wait_s = 0.0
+        word = "forward" if s.direction == "fwd" else "backward"
+        if not e.use_eye:
+            self._set_status(f"Repeat slew {e.i + 1}/{len(e.steps)}: pair {s.loop}, {word}")
+            self._exp_slew(None)
+            return
         # mirror the targets in the manual fields (and the map's target marker)
         self.r_mm.setValue(s.r_mm)
         self.phi_deg.setValue(e.plan["phi_deg"])
         self.dc_target.setValue(e.plan["dc_target_mm"])
         self._set_status(f"Experiment step {e.i + 1}/{len(e.steps)}: loop {s.loop}, "
-                         f"R = {s.r_mm:.2f} mm, {'forward' if s.direction == 'fwd' else 'backward'}")
+                         f"R = {s.r_mm:.2f} mm, {word}")
         self._exp_xy()
 
     def _exp_with_eye(self, callback, need_dc: bool):
@@ -1120,10 +1193,11 @@ class HomodyneTestWindow(QWidget):
         e = self._exp
         s = e.steps[e.i]
         p = e.plan
-        lp = res.laser_position
-        e.snapshot.update(laser_x_mm=float(lp[0]), laser_y_mm=float(lp[1]),
-                          dc_mm=float(res.delta_laser_corner), xy_moves=e.xy_moves,
-                          lens_start_um=self._lens_um)
+        e.snapshot["lens_start_um"] = self._lens_um
+        if res is not None:   # None: repeat run, no eye tracking
+            lp = res.laser_position
+            e.snapshot.update(laser_x_mm=float(lp[0]), laser_y_mm=float(lp[1]),
+                              dc_mm=float(res.delta_laser_corner), xy_moves=e.xy_moves)
         fwd = s.direction == "fwd"
         settings = SlewSettings(
             backoff_um=p["fwd_backoff_um"] if fwd else p["bwd_backoff_um"],
@@ -1134,8 +1208,9 @@ class HomodyneTestWindow(QWidget):
         )
         meta = dict(self._base_meta(),
                     expected_fringe_hz=fringe_frequency_hz(p["speed_um_s"], self.wavelength.value()),
-                    experiment=e.run_dir.name, step=e.i + 1, loop=s.loop, r_target_mm=s.r_mm,
-                    phi_target_deg=p["phi_deg"], dc_target_mm=p["dc_target_mm"], scan_direction=s.direction,
+                    experiment=e.run_dir.name, step=e.i + 1, loop=s.loop, scan_direction=s.direction,
+                    **({"r_target_mm": s.r_mm, "phi_target_deg": p["phi_deg"],
+                        "dc_target_mm": p["dc_target_mm"]} if e.use_eye else {}),
                     **{f"eye_{k}": v for k, v in e.snapshot.items() if v is not None})
         e.phase = "slew"
         self._req_slew.emit(self._daq_settings(), settings, meta)
@@ -1145,7 +1220,8 @@ class HomodyneTestWindow(QWidget):
         s = e.steps[e.i]
         self._last_rec = rec
         self._last_path = None
-        name = f"{e.i + 1:03d}_loop{s.loop}_r{s.r_mm:.2f}_{s.direction}.h5"
+        name = (f"{e.i + 1:03d}_loop{s.loop}_r{s.r_mm:.2f}_{s.direction}.h5" if s.r_mm is not None
+                else f"{e.i + 1:03d}_pair{s.loop}_{s.direction}.h5")
         try:
             self._last_path = save_recording(rec, e.run_dir / name)
             self._unsaved = False
@@ -1191,7 +1267,7 @@ class HomodyneTestWindow(QWidget):
         if self.exp_close_shutter.isChecked() and self.shutters is not None:
             self._close_shutters()
         word = "stopped" if e.abort else "finished"
-        self._set_status(f"Experiment {word}: {e.n_ok} slews saved, {e.n_fail} skipped/failed, "
+        self._set_status(f"{'Experiment' if e.use_eye else 'Repeat run'} {word}: {e.n_ok} slews saved, {e.n_fail} skipped/failed, "
                          f"{len(e.steps) - e.i} not run. Folder: {e.run_dir}")
         self._set_busy(False)
 

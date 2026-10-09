@@ -8,6 +8,7 @@ Eye-tracking moves use the same math, limits and signs as hi_frontend
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -41,9 +42,9 @@ def z_lens_move_um(dc_current_mm: float, dc_target_mm: float) -> float:
 
 @dataclass(frozen=True)
 class ExperimentStep:
-    loop: int           # 1-based
-    r_mm: float
-    direction: str      # "fwd" | "bwd"
+    loop: int                   # 1-based (loop, or pair for repeat runs)
+    r_mm: Optional[float]       # target radius; None for repeat runs (no eye tracking)
+    direction: str              # "fwd" | "bwd"
 
 
 def build_experiment_steps(radii_mm, n_loops: int) -> list[ExperimentStep]:
@@ -54,6 +55,15 @@ def build_experiment_steps(radii_mm, n_loops: int) -> list[ExperimentStep]:
     for k in range(1, int(n_loops) + 1):
         steps += [ExperimentStep(k, r, "fwd") for r in radii]
         steps += [ExperimentStep(k, r, "bwd") for r in reversed(radii)]
+    return steps
+
+
+def build_repeat_steps(n_pairs: int) -> list[ExperimentStep]:
+    """Repeat runs without eye tracking: fwd, bwd, fwd, bwd, ... (n_pairs of
+    each), alternating so slow drifts affect both directions equally."""
+    steps = []
+    for k in range(1, int(n_pairs) + 1):
+        steps += [ExperimentStep(k, None, "fwd"), ExperimentStep(k, None, "bwd")]
     return steps
 
 

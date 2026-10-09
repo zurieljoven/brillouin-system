@@ -52,3 +52,14 @@ def test_z_move_sign_and_clamp():
     # delta_c is +0.5 mm, target -1 mm: focus must go 1.5 mm deeper -> lens +1500 um
     assert z_lens_move_um(0.5, -1.0) == pytest.approx(1500.0)
     assert z_lens_move_um(10.0, -1.0) == pytest.approx(MAX_Z_MOVE_UM)
+
+
+def test_repeat_steps_alternate_fwd_bwd():
+    from brillouin_system.guis.homodyne_test.experiment_plan import build_repeat_steps
+
+    steps = build_repeat_steps(50)
+    assert len(steps) == 100
+    assert [s.direction for s in steps[:4]] == ["fwd", "bwd", "fwd", "bwd"]
+    assert sum(s.direction == "fwd" for s in steps) == 50
+    assert all(s.r_mm is None for s in steps)
+    assert (steps[-1].loop, steps[-1].direction) == (50, "bwd")
