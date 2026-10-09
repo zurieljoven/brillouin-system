@@ -22,9 +22,11 @@ unsaved recording.
 
 from __future__ import annotations
 
+import csv
+import json
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -40,6 +42,9 @@ from PyQt5.QtWidgets import (
 )
 
 from brillouin_system.devices.ni.ni6008_multi import DIFF_RANGES_V, effective_range_v
+from brillouin_system.guis.homodyne_test.experiment_plan import (
+    MAX_XY_MOVE_UM, ExperimentStep, build_experiment_steps, radii_range, xy_stage_move_um, z_lens_move_um,
+)
 from brillouin_system.scan_managers.homodyne_processing import (
     fringe_band_hz, fringe_frequency_hz, locate_peak, process_channels,
 )
@@ -75,6 +80,22 @@ class SlewSettings:
 
 class _Cancelled(Exception):
     pass
+
+
+@dataclass
+class _ExperimentState:
+    plan: dict
+    steps: list
+    run_dir: Path
+    i: int = 0                  # index of the current step
+    phase: str = ""             # "xy_move" | "z_move" | "slew"
+    xy_moves: int = 0
+    eye_wait_s: float = 0.0
+    snapshot: dict = field(default_factory=dict)
+    abort: bool = False
+    n_ok: int = 0
+    n_fail: int = 0
+
 
 
 class HomodyneWorker(QObject):
@@ -282,6 +303,10 @@ class HomodyneTestWindow(QWidget):
         self._last_peak_z: Optional[float] = None
         self._lens_um: Optional[float] = None
         self._pending_z_after_xy = False
+        self._exp: Optional[_ExperimentState] = None
+        self._stage_xyz: Optional[tuple[float, float, float]] = None
+        self._shown_peak = None
+        self._shown_peak_z: Optional[float] = None
 
         self.daq, self.zaber, connect_error = self._connect(use_dummy, zaber_port, ni_device)
         errors = [connect_error] if connect_error else []
@@ -573,7 +598,7 @@ class HomodyneTestWindow(QWidget):
         pos_scroll = QScrollArea()
         pos_scroll.setWidget(self._build_positioning_controls())
         pos_scroll.setWidgetResizable(True)
-        pos_scroll.setFixedWidth(400)
+        pos_scroll.setFixedWidth(420)
         pos_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         main = QHBoxLayout(self)
@@ -664,6 +689,56 @@ class HomodyneTestWindow(QWidget):
         cl.addWidget(g)
         self._lens_jog_btns = [lens_back, lens_fwd]
         self._stage_jog_btns = [x_left, x_right, y_up, y_down, z_back, z_fwd]
+
+        # Automated radial experiment
+        g = QGroupBox("Automated experiment (Move XYZ + slew per radius)")
+        f = QFormLayout(g)
+        self.exp_phi = _dspin(-3600.0, 3600.0, 0.0, 15.0, 1, " deg")
+        self.exp_dc = _dspin(-10.0, 10.0, -1.0, 0.1, 3, " mm")
+        self.exp_r0 = _dspin(0.0, 10.0, 0.0, 0.5, 2, " mm")
+        self.exp_r1 = _dspin(0.0, 10.0, 4.0, 0.5, 2, " mm")
+        self.exp_dr = _dspin(0.01, 10.0, 0.5, 0.1, 2, " mm")
+        self.exp_loops = QSpinBox()
+        self.exp_loops.setRange(1, 100)
+        self.exp_loops.setValue(5)
+        self.exp_fwd_backoff = _dspin(0.0, MAX_RANGE_UM, 500.0, 50.0, 0, " um")
+        self.exp_fwd_range = _dspin(1.0, MAX_RANGE_UM, 2500.0, 50.0, 0, " um")
+        self.exp_bwd_backoff = _dspin(0.0, MAX_RANGE_UM, 2000.0, 50.0, 0, " um")
+        self.exp_bwd_range = _dspin(1.0, MAX_RANGE_UM, 2500.0, 50.0, 0, " um")
+        self.exp_xy_tol = _dspin(0.001, 1.0, 0.05, 0.01, 3, " mm")
+        self.exp_xy_moves = QSpinBox()
+        self.exp_xy_moves.setRange(1, 10)
+        self.exp_xy_moves.setValue(3)
+        self.exp_open_shutter = QCheckBox("Open sample shutter at start")
+        self.exp_open_shutter.setChecked(True)
+        self.exp_close_shutter = QCheckBox("Close all shutters when done")
+        self.exp_close_shutter.setChecked(True)
+        self.exp_info = QLabel()
+        self.exp_info.setWordWrap(True)
+        self.exp_btn = QPushButton("Start experiment")
+        self.exp_btn.clicked.connect(self._exp_start)
+        for wdg in (self.exp_r0, self.exp_r1, self.exp_dr, self.exp_fwd_range, self.exp_bwd_range):
+            wdg.valueChanged.connect(self._exp_update_info)
+        self.exp_loops.valueChanged.connect(self._exp_update_info)
+        self.speed.valueChanged.connect(self._exp_update_info)
+        f.addRow("phi:", self.exp_phi)
+        f.addRow("Δc:", self.exp_dc)
+        f.addRow("R from:", self.exp_r0)
+        f.addRow("R to:", self.exp_r1)
+        f.addRow("R step:", self.exp_dr)
+        f.addRow("Loops:", self.exp_loops)
+        f.addRow("Fwd back-off:", self.exp_fwd_backoff)
+        f.addRow("Fwd range:", self.exp_fwd_range)
+        f.addRow("Bwd back-off:", self.exp_bwd_backoff)
+        f.addRow("Bwd range:", self.exp_bwd_range)
+        f.addRow("XY tolerance:", self.exp_xy_tol)
+        f.addRow("Max XY moves:", self.exp_xy_moves)
+        f.addRow(self.exp_open_shutter)
+        f.addRow(self.exp_close_shutter)
+        f.addRow(self.exp_info)
+        f.addRow(self.exp_btn)
+        cl.addWidget(g)
+        self._exp_update_info()
 
         # Eye-tracker settings (thresholds/exposure for the fake eyes)
         g = QGroupBox("Eye tracker")
@@ -757,6 +832,7 @@ class HomodyneTestWindow(QWidget):
         self.move_z_btn.setEnabled(idle and has_eye)
         self.move_xyz_btn.setEnabled(idle and has_eye and has_stage)
         self.go_peak_btn.setEnabled(idle and self._last_peak_z is not None)
+        self.exp_btn.setEnabled(idle and has_eye and has_stage)
 
     @pyqtSlot(str)
     def _set_status(self, text: str):
@@ -771,6 +847,7 @@ class HomodyneTestWindow(QWidget):
 
     @pyqtSlot(float, float, float)
     def _set_stage_position(self, x: float, y: float, z: float):
+        self._stage_xyz = (x, y, z)
         self.stage_label.setText(f"{x:.1f} / {y:.1f} / {z:.1f}")
 
     # ------------------------------------------------------------------ positioning
@@ -793,25 +870,20 @@ class HomodyneTestWindow(QWidget):
         return res
 
     def _move_xy(self) -> bool:
-        """Rig-stage move so the laser lands at (R, phi) in pupil coordinates.
-        Same math, limit and signs as hi_frontend.on_move_xy_polar_clicked."""
+        """Rig-stage move so the laser lands at (R, phi) in pupil coordinates."""
         res = self._fresh_eye_result()
         if res is None:
             return False
-        phi = np.deg2rad(self.phi_deg.value())
-        dx_um = (self.r_mm.value() * np.cos(phi) - float(res.laser_position[0])) * 1000.0
-        dy_um = (self.r_mm.value() * np.sin(phi) - float(res.laser_position[1])) * 1000.0
-        mag = float(np.hypot(dx_um, dy_um))
-        if mag > 3500.0:
-            dx_um, dy_um = dx_um * 3500.0 / mag, dy_um * 3500.0 / mag
-            self._set_status(f"XY move {mag / 1000:.2f} mm clamped to 3.5 mm.")
+        dx_stage, dy_stage, err_mm, clamped = xy_stage_move_um(
+            res.laser_position, self.r_mm.value(), self.phi_deg.value())
+        if clamped:
+            self._set_status(f"XY move {err_mm:.2f} mm clamped to {MAX_XY_MOVE_UM / 1000:.1f} mm.")
         self._set_busy(True)
-        self._req_stage_rel.emit(-dx_um, dy_um, 0.0)   # stage +X moves the laser -X
+        self._req_stage_rel.emit(dx_stage, dy_stage, 0.0)
         return True
 
     def _move_z(self, retries: int = 0):
-        """Eye-lens move so delta_c reaches the target. Same math, limit and
-        sign as hi_frontend.on_move_z_by_dc_clicked."""
+        """Eye-lens move so delta_c reaches the target."""
         res = self.eye_panel.latest_result(max_age_s=0.3) if self.eye_panel is not None else None
         if res is None or res.delta_laser_corner is None:
             if retries > 0:
@@ -820,16 +892,17 @@ class HomodyneTestWindow(QWidget):
             self._set_status("Move Z: no recent Δc from the eye tracker.")
             self._set_busy(False)
             return
-        dz_um = (self.dc_target.value() - float(res.delta_laser_corner)) * 1000.0
-        dz_um = float(np.clip(dz_um, -2000.0, 2000.0))
         self._set_busy(True)
-        self._req_lens_rel.emit(-dz_um)
+        self._req_lens_rel.emit(z_lens_move_um(res.delta_laser_corner, self.dc_target.value()))
 
     def _move_xyz(self):
         self._pending_z_after_xy = self._move_xy()
 
     @pyqtSlot()
     def _on_move_done(self):
+        if self._exp is not None:
+            self._exp_on_move_done()
+            return
         if self._pending_z_after_xy:
             # Δc depends on where the laser sits on the curved cornea, so wait
             # for eye-tracker results taken after the XY move.
@@ -872,6 +945,255 @@ class HomodyneTestWindow(QWidget):
         self._set_status("Restarting eye tracker ...")
         self.eye_panel.restart()
         self._set_status("Eye tracker restarted.")
+
+    # ------------------------------------------------------------------ automated experiment
+    #
+    # Per step: Move XY (closed loop: re-measure after each stage move until
+    # within XY tolerance or max moves), Move Z to the delta_c target, take a
+    # fresh eye snapshot, slew (returns to the Move-XYZ z), save to the run
+    # folder, append a row to run_log.csv. Driven by worker signals, so the
+    # GUI stays responsive and STOP works between and during actions.
+
+    EXP_EYE_TIMEOUT_S = 10.0    # wait this long for a usable eye result, else skip the step
+    EXP_SETTLE_MS = 600         # after a move, wait for eye frames taken at the new position
+    EXP_LOG_FIELDS = ["step", "loop", "r_target_mm", "phi_target_deg", "direction", "file", "status",
+                      "laser_x_mm", "laser_y_mm", "xy_err_mm", "xy_moves", "dc_mm", "lens_start_um",
+                      "stage_x_um", "stage_y_um", "stage_z_um", "peak_z_um", "peak_snr", "time"]
+
+    def _exp_plan(self) -> dict:
+        return {
+            "phi_deg": self.exp_phi.value(),
+            "dc_target_mm": self.exp_dc.value(),
+            "radii_mm": radii_range(self.exp_r0.value(), self.exp_r1.value(), self.exp_dr.value()),
+            "n_loops": self.exp_loops.value(),
+            "fwd_backoff_um": self.exp_fwd_backoff.value(),
+            "fwd_range_um": self.exp_fwd_range.value(),
+            "bwd_backoff_um": self.exp_bwd_backoff.value(),
+            "bwd_range_um": self.exp_bwd_range.value(),
+            "speed_um_s": self.speed.value(),
+            "xy_tol_mm": self.exp_xy_tol.value(),
+            "max_xy_moves": self.exp_xy_moves.value(),
+        }
+
+    def _exp_update_info(self, *_):
+        try:
+            p = self._exp_plan()
+        except ValueError as e:
+            self.exp_info.setText(str(e))
+            return
+        n_r = len(p["radii_mm"])
+        n = 2 * n_r * p["n_loops"]
+        # slew time + ~6 s per slew for moves, settling and the return move
+        t = p["n_loops"] * n_r * (p["fwd_range_um"] + p["bwd_range_um"]) / p["speed_um_s"] + 6.0 * n
+        self.exp_info.setText(f"{n} slews ({n_r} radii x 2 directions x {p['n_loops']} loops), "
+                              f"roughly {t / 60:.0f} min at {p['speed_um_s']:.0f} um/s.")
+
+    def _exp_start(self):
+        if self._exp is not None:
+            return
+        if self.eye_panel is None or self.stage is None or self._worker is None:
+            QMessageBox.warning(self, "Experiment", "Needs the eye tracker, the rig stage and the eye lens.")
+            return
+        try:
+            plan = self._exp_plan()
+            self._daq_settings_validated()
+            fringe_band_hz(plan["speed_um_s"], self.wavelength.value(), float(self.fs.value()))
+        except ValueError as e:
+            QMessageBox.warning(self, "Experiment", str(e))
+            return
+        if not self._confirm_discard_unsaved("start the experiment"):
+            return
+        steps = build_experiment_steps(plan["radii_mm"], plan["n_loops"])
+        run_dir = Path(self.save_dir.text()) / f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        r = QMessageBox.question(
+            self, "Start experiment",
+            f"{self.exp_info.text()}\n\nThe rig stage and eye lens will move. Every slew is saved to\n"
+            f"{run_dir}\n\nStart?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r != QMessageBox.Yes:
+            return
+        try:
+            run_dir.mkdir(parents=True, exist_ok=False)
+            with open(run_dir / "plan.json", "w") as fh:
+                json.dump(dict(plan, **self._base_meta(), n_steps=len(steps)), fh, indent=2, default=float)
+            with open(run_dir / "run_log.csv", "w", newline="") as fh:
+                csv.DictWriter(fh, fieldnames=self.EXP_LOG_FIELDS).writeheader()
+        except OSError as e:
+            QMessageBox.warning(self, "Experiment", f"Cannot create the run folder: {e}")
+            return
+
+        self._exp = _ExperimentState(plan=plan, steps=steps, run_dir=run_dir)
+        self._set_busy(True)
+        if self.exp_open_shutter.isChecked() and self.shutters is not None:
+            self._open_sample_shutter()
+        self._exp_next()
+
+    def _exp_log(self, step: ExperimentStep, status: str, file: str = "", peak=None):
+        e = self._exp
+        snap = e.snapshot
+        sx, sy, sz = self._stage_xyz if self._stage_xyz is not None else (None, None, None)
+        row = {
+            "step": e.i + 1, "loop": step.loop, "r_target_mm": step.r_mm,
+            "phi_target_deg": e.plan["phi_deg"], "direction": step.direction, "file": file, "status": status,
+            "laser_x_mm": snap.get("laser_x_mm"), "laser_y_mm": snap.get("laser_y_mm"),
+            "xy_err_mm": snap.get("xy_err_mm"), "xy_moves": snap.get("xy_moves", e.xy_moves),
+            "dc_mm": snap.get("dc_mm"), "lens_start_um": snap.get("lens_start_um"),
+            "stage_x_um": sx, "stage_y_um": sy, "stage_z_um": sz,
+            "peak_z_um": peak.x_peak if peak is not None and peak.found else None,
+            "peak_snr": peak.snr if peak is not None else None,
+            "time": datetime.now().isoformat(timespec="seconds"),
+        }
+        with open(e.run_dir / "run_log.csv", "a", newline="") as fh:
+            csv.DictWriter(fh, fieldnames=self.EXP_LOG_FIELDS).writerow(row)
+
+    def _exp_next(self):
+        e = self._exp
+        if e is None:
+            return
+        if e.abort or e.i >= len(e.steps):
+            self._exp_finish()
+            return
+        s = e.steps[e.i]
+        e.xy_moves = 0
+        e.snapshot = {}
+        e.eye_wait_s = 0.0
+        # mirror the targets in the manual fields (and the map's target marker)
+        self.r_mm.setValue(s.r_mm)
+        self.phi_deg.setValue(e.plan["phi_deg"])
+        self.dc_target.setValue(e.plan["dc_target_mm"])
+        self._set_status(f"Experiment step {e.i + 1}/{len(e.steps)}: loop {s.loop}, "
+                         f"R = {s.r_mm:.2f} mm, {'forward' if s.direction == 'fwd' else 'backward'}")
+        self._exp_xy()
+
+    def _exp_with_eye(self, callback, need_dc: bool):
+        """callback(result) once a fresh eye result is available; skip the step after a timeout."""
+        e = self._exp
+        if e is None:
+            return
+        if e.abort:
+            self._exp_finish()
+            return
+        res = self.eye_panel.latest_result(max_age_s=0.3)
+        if res is not None and (not need_dc or res.delta_laser_corner is not None):
+            e.eye_wait_s = 0.0
+            callback(res)
+            return
+        e.eye_wait_s += 0.2
+        if e.eye_wait_s > self.EXP_EYE_TIMEOUT_S:
+            self._exp_skip("no eye-tracker result" + (" with delta_c" if need_dc else ""))
+            return
+        QTimer.singleShot(200, lambda: self._exp_with_eye(callback, need_dc))
+
+    def _exp_xy(self):
+        self._exp_with_eye(self._exp_xy_with, need_dc=False)
+
+    def _exp_xy_with(self, res):
+        e = self._exp
+        s = e.steps[e.i]
+        dx, dy, err_mm, _ = xy_stage_move_um(res.laser_position, s.r_mm, e.plan["phi_deg"])
+        e.snapshot["xy_err_mm"] = err_mm
+        if err_mm <= e.plan["xy_tol_mm"] or e.xy_moves >= e.plan["max_xy_moves"]:
+            self._exp_z()
+            return
+        e.xy_moves += 1
+        e.phase = "xy_move"
+        self._req_stage_rel.emit(dx, dy, 0.0)
+
+    def _exp_z(self):
+        self._exp_with_eye(self._exp_z_with, need_dc=True)
+
+    def _exp_z_with(self, res):
+        e = self._exp
+        e.phase = "z_move"
+        self._req_lens_rel.emit(z_lens_move_um(res.delta_laser_corner, e.plan["dc_target_mm"]))
+
+    def _exp_on_move_done(self):
+        e = self._exp
+        if e.abort:
+            self._exp_finish()
+        elif e.phase == "xy_move":
+            QTimer.singleShot(self.EXP_SETTLE_MS, self._exp_xy)       # re-measure, maybe correct again
+        elif e.phase == "z_move":
+            QTimer.singleShot(self.EXP_SETTLE_MS,
+                              lambda: self._exp_with_eye(self._exp_slew, need_dc=True))
+
+    def _exp_slew(self, res):
+        e = self._exp
+        s = e.steps[e.i]
+        p = e.plan
+        lp = res.laser_position
+        e.snapshot.update(laser_x_mm=float(lp[0]), laser_y_mm=float(lp[1]),
+                          dc_mm=float(res.delta_laser_corner), xy_moves=e.xy_moves,
+                          lens_start_um=self._lens_um)
+        fwd = s.direction == "fwd"
+        settings = SlewSettings(
+            backoff_um=p["fwd_backoff_um"] if fwd else p["bwd_backoff_um"],
+            range_um=p["fwd_range_um"] if fwd else p["bwd_range_um"],
+            speed_um_s=p["speed_um_s"],
+            reverse=not fwd,
+            return_to_start=True,
+        )
+        meta = dict(self._base_meta(),
+                    expected_fringe_hz=fringe_frequency_hz(p["speed_um_s"], self.wavelength.value()),
+                    experiment=e.run_dir.name, step=e.i + 1, loop=s.loop, r_target_mm=s.r_mm,
+                    phi_target_deg=p["phi_deg"], dc_target_mm=p["dc_target_mm"], scan_direction=s.direction,
+                    **{f"eye_{k}": v for k, v in e.snapshot.items() if v is not None})
+        e.phase = "slew"
+        self._req_slew.emit(self._daq_settings(), settings, meta)
+
+    def _exp_on_recording(self, rec: HomodyneRecording):
+        e = self._exp
+        s = e.steps[e.i]
+        self._last_rec = rec
+        self._last_path = None
+        name = f"{e.i + 1:03d}_loop{s.loop}_r{s.r_mm:.2f}_{s.direction}.h5"
+        try:
+            self._last_path = save_recording(rec, e.run_dir / name)
+            self._unsaved = False
+            status = "stopped" if rec.meta.get("stopped_early") else "ok"
+            e.n_ok += 1
+        except Exception as ex:
+            self._unsaved = True
+            status = f"save failed: {ex}"
+            e.n_fail += 1
+        self._show(rec)
+        self._last_peak_z = self._shown_peak_z
+        self.peak_label.setText(f"Last slew peak: z = {self._last_peak_z:.2f} um"
+                                if self._last_peak_z is not None else "Last slew peak: none found")
+        self._exp_log(s, status, name, self._shown_peak)
+        if rec.meta.get("stopped_early"):
+            e.abort = True
+        e.i += 1
+        self._exp_next()
+
+    def _exp_skip(self, reason: str):
+        e = self._exp
+        self._exp_log(e.steps[e.i], f"skipped: {reason}")
+        e.n_fail += 1
+        e.i += 1
+        self._exp_next()
+
+    def _exp_on_failed(self, msg: str):
+        e = self._exp
+        if e.i < len(e.steps):
+            self._exp_log(e.steps[e.i], f"error: {msg}")
+        e.n_fail += 1
+        user_stop = e.abort
+        e.abort = True
+        self._exp_finish()
+        if not user_stop:
+            QMessageBox.warning(self, "Experiment stopped", f"Stopped after an error:\n{msg}")
+
+    def _exp_finish(self):
+        e = self._exp
+        if e is None:
+            return
+        self._exp = None
+        if self.exp_close_shutter.isChecked() and self.shutters is not None:
+            self._close_shutters()
+        word = "stopped" if e.abort else "finished"
+        self._set_status(f"Experiment {word}: {e.n_ok} slews saved, {e.n_fail} skipped/failed, "
+                         f"{len(e.steps) - e.i} not run. Folder: {e.run_dir}")
+        self._set_busy(False)
 
     def _browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Save folder", self.save_dir.text())
@@ -927,12 +1249,17 @@ class HomodyneTestWindow(QWidget):
                     terminal=d.terminal, v_range=d.v_range).validate()
 
     def _stop(self):
+        if self._exp is not None:
+            self._exp.abort = True   # ends after the current move; a running slew stops now
         if self._worker is not None:
             self._worker.request_stop()
             self._set_status("Stopping ...")
 
     @pyqtSlot(object)
     def _on_finished(self, rec: HomodyneRecording):
+        if self._exp is not None:
+            self._exp_on_recording(rec)
+            return
         self._last_rec = rec
         self._last_path = None
         self._unsaved = True
@@ -982,6 +1309,9 @@ class HomodyneTestWindow(QWidget):
 
     @pyqtSlot(str)
     def _on_failed(self, msg: str):
+        if self._exp is not None:
+            self._exp_on_failed(msg)
+            return
         self._pending_z_after_xy = False
         self._set_busy(False)
         self._set_status(f"Error: {msg}")
@@ -1046,12 +1376,14 @@ class HomodyneTestWindow(QWidget):
                 lines.append(f"LO balance DC_H/DC_V = {dc[0] / dc[1]:.3f}  (adjust paddles toward 1.0)")
 
         peak = None
+        self._shown_peak = None
         self._shown_peak_z = None
         if trace is not None:
             edge = int(2 * fs / max(trace.band_hz[0], 1.0))
             lines.append(f"S: median {np.median(trace.s):.4f}, max {np.max(trace.s):.4f} sqrt(V)")
             if rec.mode == "slew":
                 peak = locate_peak(x, trace.s, edge_samples=edge)
+                self._shown_peak = peak
                 if peak.found and z is not None:
                     self._shown_peak_z = peak.x_peak
                 if peak.found:

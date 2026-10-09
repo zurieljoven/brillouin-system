@@ -167,8 +167,8 @@ class PeakResult:
     found: bool
     x_peak: Optional[float]     # centroid position (same units as x)
     s_peak: float               # max of S
-    background: float           # median of S (noise floor)
-    noise_std: float            # robust std of S (1.4826 * MAD)
+    background: float           # median of S away from the peak (noise floor)
+    noise_std: float            # std of S away from the peak
     snr: float                  # (s_peak - background) / noise_std
 
 
@@ -183,13 +183,17 @@ def locate_peak(
     """
     Locate the surface peak in S(x).
 
-    The noise floor is estimated robustly (median / MAD of S), so the peak
-    itself barely biases it. The position is the S-weighted centroid of the
-    contiguous region around the maximum where S exceeds
+    The noise floor is measured AWAY from the candidate peak: the half-max
+    region around the maximum, widened by its own width on each side, is
+    excluded, and the background / noise are the median / standard
+    deviation of the rest. Using the plain std (not a robust MAD) is
+    deliberate: bursty artifacts elsewhere in the record (e.g. ADC
+    quantization toggling on a coarse range) then count as noise, so a
+    burst is not mistaken for the surface. The position is the S-weighted
+    centroid of the contiguous region around the maximum where S exceeds
     background + centroid_fraction * (peak - background). Returns
-    found=False when the peak SNR is below min_snr (no surface) instead of
-    a random noise maximum. edge_samples are ignored at both ends (filter
-    edge effects).
+    found=False when the peak SNR is below min_snr (no surface).
+    edge_samples are ignored at both ends (filter edge effects).
     """
     x = np.asarray(x, dtype=np.float64)
     s = np.asarray(s, dtype=np.float64)
@@ -202,21 +206,41 @@ def locate_peak(
         lo_i, hi_i = 0, s.size
     xs, ss = x[lo_i:hi_i], s[lo_i:hi_i]
 
-    background = float(np.median(ss))
-    noise_std = float(1.4826 * np.median(np.abs(ss - background)))
     k = int(np.argmax(ss))
     s_peak = float(ss[k])
-    snr = (s_peak - background) / noise_std if noise_std > 0 else float("inf")
+
+    def contiguous_above(level: float) -> tuple[int, int]:
+        a = b = k
+        while a > 0 and ss[a - 1] > level:
+            a -= 1
+        while b < ss.size - 1 and ss[b + 1] > level:
+            b += 1
+        return a, b
+
+    # noise statistics from outside the candidate peak
+    h0, h1 = contiguous_above(float(np.median(ss)) + 0.5 * (s_peak - float(np.median(ss))))
+    width = h1 - h0 + 1
+    outside = np.ones(ss.size, dtype=bool)
+    outside[max(0, h0 - width):min(ss.size, h1 + width + 1)] = False
+    rest = ss[outside]
+    if rest.size >= 10:
+        background = float(np.median(rest))
+        noise_std = float(np.std(rest))
+    else:  # peak fills the record: fall back to robust statistics
+        background = float(np.median(ss))
+        noise_std = float(1.4826 * np.median(np.abs(ss - background)))
+
+    if s_peak <= background:      # flat record (e.g. a constant, quantized trace)
+        snr = 0.0
+    elif noise_std > 0:
+        snr = (s_peak - background) / noise_std
+    else:
+        snr = float("inf")
     if not snr >= min_snr:
         return PeakResult(False, None, s_peak, background, noise_std, float(snr))
 
     level = background + centroid_fraction * (s_peak - background)
-    i0 = k
-    while i0 > 0 and ss[i0 - 1] > level:
-        i0 -= 1
-    i1 = k
-    while i1 < ss.size - 1 and ss[i1 + 1] > level:
-        i1 += 1
+    i0, i1 = contiguous_above(level)
     w = ss[i0:i1 + 1] - level
     x_peak = float(np.sum(w * xs[i0:i1 + 1]) / np.sum(w)) if np.sum(w) > 0 else float(xs[k])
     return PeakResult(True, x_peak, s_peak, background, noise_std, float(snr))

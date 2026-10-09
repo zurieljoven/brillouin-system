@@ -110,6 +110,36 @@ def _example_recording():
     )
 
 
+def test_quantization_toggling_is_not_a_surface():
+    """A DC level sitting on an LSB boundary of a coarse ADC range toggles
+    throughout the record; the resulting envelope bursts must not be
+    reported as a surface (this produced false peaks before)."""
+    rng = np.random.default_rng(7)
+    n = int(1.5 * FS)
+    lsb = 20.0 / 2048  # USB-6008 RSE
+    v = np.empty((2, n))
+    v[0] = 0.8
+    v[1] = np.round((0.65 + 0.5 * lsb + rng.normal(0, 3e-4, n)) / lsb) * lsb
+    z = 400.0 * np.arange(n) / FS
+    trace = process_channels(v, FS, fringe_band_hz(400.0, LAMBDA_NM, FS))
+    assert not locate_peak(z, trace.s, edge_samples=20).found
+
+
+def test_flat_record_is_not_a_surface():
+    z = np.arange(1000.0)
+    assert not locate_peak(z, np.zeros(1000)).found
+
+
+def test_surface_found_above_quantization_bursts():
+    z, v, speed = _slew(split=0.5, amp_v=0.05, seed=5)
+    lsb = 20.0 / 2048
+    v = np.round(v / lsb) * lsb
+    trace = process_channels(v, FS, fringe_band_hz(speed, LAMBDA_NM, FS))
+    res = locate_peak(z, trace.s, edge_samples=20)
+    assert res.found
+    assert res.x_peak == pytest.approx(150.0, abs=1.5)
+
+
 @pytest.mark.parametrize("name", ["r.h5", "r.npz", "r"])
 def test_recording_roundtrip(tmp_path, name):
     rec = _example_recording()
