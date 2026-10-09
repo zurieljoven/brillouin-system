@@ -32,11 +32,11 @@ from typing import Optional
 import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox,
-    QVBoxLayout, QWidget,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from brillouin_system.devices.ni.ni6008_multi import DIFF_RANGES_V, effective_range_v
@@ -81,14 +81,17 @@ class HomodyneWorker(QObject):
     """Runs DAQ acquisitions and Zaber motion off the GUI thread."""
 
     status = pyqtSignal(str)
-    position = pyqtSignal(float)
+    position = pyqtSignal(float)                        # eye-lens z [um]
+    stage_position = pyqtSignal(float, float, float)    # rig stage x, y, z [um]
+    move_done = pyqtSignal()
     finished = pyqtSignal(object)   # HomodyneRecording
     failed = pyqtSignal(str)
 
-    def __init__(self, daq, zaber):
+    def __init__(self, daq, zaber, stage=None):
         super().__init__()
         self.daq = daq
         self.zaber = zaber
+        self.stage = stage
         self._stop = threading.Event()
 
     def request_stop(self) -> None:
@@ -100,12 +103,53 @@ class HomodyneWorker(QObject):
                            terminal=d.terminal, v_range=d.v_range)
         self.daq.validate()
 
+    def _emit_positions(self) -> None:
+        self.position.emit(float(self.zaber.get_position()))
+        if self.stage is not None:
+            self.stage_position.emit(*(float(v) for v in self.stage.get_position()))
+
     @pyqtSlot()
     def read_position(self):
         try:
-            self.position.emit(float(self.zaber.get_position()))
+            self._emit_positions()
         except Exception as e:
             self.failed.emit(f"Position read failed: {type(e).__name__}: {e}")
+
+    @pyqtSlot(float, float, float)
+    def move_stage_rel(self, dx: float, dy: float, dz: float):
+        """Relative rig-stage move [um] (moves the eye/phantom, not the lens)."""
+        try:
+            if self.stage is None:
+                raise RuntimeError("Rig stage not connected")
+            self.status.emit(f"Stage move dx={dx:+.0f} dy={dy:+.0f} dz={dz:+.0f} um ...")
+            self.stage.move_rel(dx=dx or None, dy=dy or None, dz=dz or None)
+            self._emit_positions()
+            self.status.emit("Stage move done.")
+            self.move_done.emit()
+        except Exception as e:
+            self.failed.emit(f"Stage move failed: {type(e).__name__}: {e}")
+
+    @pyqtSlot(float)
+    def move_lens_rel(self, dz: float):
+        try:
+            self.status.emit(f"Eye-lens move {dz:+.1f} um ...")
+            self.zaber.move_rel(dz)
+            self._emit_positions()
+            self.status.emit("Eye-lens move done.")
+            self.move_done.emit()
+        except Exception as e:
+            self.failed.emit(f"Eye-lens move failed: {type(e).__name__}: {e}")
+
+    @pyqtSlot(float)
+    def move_lens_abs(self, z: float):
+        try:
+            self.status.emit(f"Eye-lens move to {z:.1f} um ...")
+            self.zaber.move_abs(z)
+            self._emit_positions()
+            self.status.emit("Eye-lens move done.")
+            self.move_done.emit()
+        except Exception as e:
+            self.failed.emit(f"Eye-lens move failed: {type(e).__name__}: {e}")
 
     @pyqtSlot(object, float, object)
     def run_stationary(self, daq_settings: DaqSettings, duration_s: float, meta: dict):
@@ -220,9 +264,13 @@ class HomodyneTestWindow(QWidget):
     _req_stationary = pyqtSignal(object, float, object)
     _req_slew = pyqtSignal(object, object, object)
     _req_position = pyqtSignal()
+    _req_stage_rel = pyqtSignal(float, float, float)
+    _req_lens_rel = pyqtSignal(float)
+    _req_lens_abs = pyqtSignal(float)
 
     def __init__(self, *, use_dummy: bool, zaber_port: str = "COM5", ni_device: str = "Dev1",
-                 save_dir: Optional[Path] = None):
+                 stage_port: str = "COM6", include_eye_tracking: bool = True,
+                 use_eye_tracker_dummy: Optional[bool] = None, save_dir: Optional[Path] = None):
         super().__init__()
         self.setWindowTitle("Homodyne Plane Test" + ("  [DUMMY]" if use_dummy else ""))
         self.use_dummy = use_dummy
@@ -231,11 +279,26 @@ class HomodyneTestWindow(QWidget):
         self._last_rec: Optional[HomodyneRecording] = None
         self._last_path: Optional[Path] = None
         self._unsaved = False   # last acquisition not saved yet
+        self._last_peak_z: Optional[float] = None
+        self._lens_um: Optional[float] = None
+        self._pending_z_after_xy = False
 
         self.daq, self.zaber, connect_error = self._connect(use_dummy, zaber_port, ni_device)
-        self.shutters, shutter_error = self._connect_shutters(use_dummy)
-        if shutter_error:
-            connect_error = f"{connect_error}\n{shutter_error}" if connect_error else shutter_error
+        errors = [connect_error] if connect_error else []
+        self.stage, err = self._connect_stage(use_dummy, stage_port)
+        if err:
+            errors.append(err)
+        self.shutters, err = self._connect_shutters(use_dummy)
+        if err:
+            errors.append(err)
+
+        self.eye_panel = None
+        if include_eye_tracking:
+            from brillouin_system.guis.homodyne_test.eye_tracking_panel import EyeTrackingPanel
+            et_dummy = use_dummy if use_eye_tracker_dummy is None else use_eye_tracker_dummy
+            self.eye_panel = EyeTrackingPanel(use_dummy=et_dummy)
+            if self.eye_panel.offset_error:
+                errors.append(self.eye_panel.offset_error)
 
         self._build_ui(save_dir or Path.home() / "Documents" / "homodyne_recordings")
         self._update_fringe_info()
@@ -243,24 +306,49 @@ class HomodyneTestWindow(QWidget):
         self._thread = QThread(self)
         self._worker = None
         if self.zaber is not None:
-            self._worker = HomodyneWorker(self.daq, self.zaber)
+            self._worker = HomodyneWorker(self.daq, self.zaber, self.stage)
             self._worker.moveToThread(self._thread)
             self._worker.status.connect(self._set_status)
             self._worker.position.connect(self._set_position)
+            self._worker.stage_position.connect(self._set_stage_position)
+            self._worker.move_done.connect(self._on_move_done)
             self._worker.finished.connect(self._on_finished)
             self._worker.failed.connect(self._on_failed)
             self._req_stationary.connect(self._worker.run_stationary)
             self._req_slew.connect(self._worker.run_slew)
             self._req_position.connect(self._worker.read_position)
+            self._req_stage_rel.connect(self._worker.move_stage_rel)
+            self._req_lens_rel.connect(self._worker.move_lens_rel)
+            self._req_lens_abs.connect(self._worker.move_lens_abs)
             self._thread.start()
             self._req_position.emit()
         self._set_busy(False)
 
-        if connect_error:
-            self._set_status(connect_error)
-            QMessageBox.critical(self, "Hardware connection failed", connect_error)
+        if self.eye_panel is not None:
+            self.eye_panel.start()
+
+        if errors:
+            msg = "\n".join(errors)
+            self._set_status(msg)
+            QMessageBox.critical(self, "Hardware connection problem", msg)
 
     # ------------------------------------------------------------------ devices
+
+    @staticmethod
+    def _connect_stage(use_dummy: bool, stage_port: str):
+        """Rig XYZ stage (moves the eye/phantom), attached WITHOUT homing or moving."""
+        try:
+            if use_dummy:
+                from brillouin_system.devices.zaber_engines.zaber_human_interface.zaber_human_interface import \
+                    ZaberHumanInterfaceDummy
+                stage = ZaberHumanInterfaceDummy(home_on_connect=False)
+                stage.move_abs(12e3, 10e3, 12e3)   # dummy only: a plausible starting position
+                return stage, None
+            from brillouin_system.devices.zaber_engines.zaber_human_interface.zaber_human_interface import \
+                ZaberHumanInterface
+            return ZaberHumanInterface(port=stage_port, home_on_connect=False), None
+        except Exception as e:
+            return None, f"Rig stage not connected ({type(e).__name__}: {e}); Move XY / stage jogs disabled."
 
     @staticmethod
     def _connect(use_dummy: bool, zaber_port: str, ni_device: str):
@@ -469,14 +557,136 @@ class HomodyneTestWindow(QWidget):
         self.summary = QPlainTextEdit()
         self.summary.setReadOnly(True)
         self.summary.setMaximumHeight(170)
-        right = QVBoxLayout()
+        data_tab = QWidget()
+        right = QVBoxLayout(data_tab)
+        right.setContentsMargins(0, 0, 0, 0)
         right.addWidget(NavigationToolbar2QT(self.canvas, self))
         right.addWidget(self.canvas, stretch=1)
         right.addWidget(self.summary)
 
+        self.tabs = QTabWidget()
+        self.tabs.addTab(data_tab, "Data")
+        if self.eye_panel is not None:
+            self.tabs.addTab(self.eye_panel, "Eye tracking")
+
+        # positioning controls get their own scroll column next to the DAQ one
+        pos_scroll = QScrollArea()
+        pos_scroll.setWidget(self._build_positioning_controls())
+        pos_scroll.setWidgetResizable(True)
+        pos_scroll.setFixedWidth(400)
+        pos_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
         main = QHBoxLayout(self)
         main.addWidget(scroll)
-        main.addLayout(right, stretch=1)
+        main.addWidget(pos_scroll)
+        main.addWidget(self.tabs, stretch=1)
+
+    def _build_positioning_controls(self) -> QWidget:
+        w = QWidget()
+        cl = QVBoxLayout(w)
+        has_eye = self.eye_panel is not None
+
+        # Eye tracking: Move XY (rig stage) / Move Z (eye lens), as in the main GUI
+        g = QGroupBox("Eye tracking: Move XY / Move Z")
+        f = QFormLayout(g)
+        self.eye_label = QLabel("laser x/y: —\nΔc: —" if has_eye else "Eye tracking disabled")
+        self.eye_label.setStyleSheet("font-family: monospace;")
+        f.addRow(self.eye_label)
+        self.r_mm = _dspin(-10.0, 10.0, 0.0, 0.25, 3, " mm")
+        self.phi_deg = _dspin(-3600.0, 3600.0, 0.0, 15.0, 1, " deg")
+        self.move_xy_btn = QPushButton("Move XY")
+        self.move_xy_btn.setToolTip("Move the rig stage so the laser lands at (R, phi) relative "
+                                    "to the pupil center (max 3.5 mm per move).")
+        self.move_xy_btn.clicked.connect(self._move_xy)
+        self.dc_target = _dspin(-10.0, 10.0, 2.0, 0.1, 3, " mm")
+        self.move_z_btn = QPushButton("Move Z")
+        self.move_z_btn.setToolTip("Move the EYE LENS so Δc (laser focus to cornea) reaches the "
+                                   "target (max 2 mm per move). This leaves the reflection plane.")
+        self.move_z_btn.clicked.connect(lambda: self._move_z())
+        self.move_xyz_btn = QPushButton("Move XYZ")
+        self.move_xyz_btn.setToolTip("Move XY, wait for a fresh eye-tracker result, then Move Z.")
+        self.move_xyz_btn.clicked.connect(self._move_xyz)
+        for spin in (self.r_mm, self.phi_deg):
+            spin.valueChanged.connect(self._update_target_marker)
+        f.addRow("R:", self.r_mm)
+        f.addRow("phi:", self.phi_deg)
+        f.addRow(self.move_xy_btn)
+        f.addRow("Δc target:", self.dc_target)
+        f.addRow(self.move_z_btn)
+        f.addRow(self.move_xyz_btn)
+        cl.addWidget(g)
+
+        # Plane: jump to the surface found by the last slew
+        g = QGroupBox("Reflection plane")
+        f = QFormLayout(g)
+        self.peak_label = QLabel("Last slew peak: —")
+        self.go_peak_btn = QPushButton("Move lens to last slew peak")
+        self.go_peak_btn.setToolTip("Absolute eye-lens move to the S peak of the last slew "
+                                    "(forward/backward slews differ by ~±2 um of timing lag).")
+        self.go_peak_btn.clicked.connect(self._go_to_peak)
+        f.addRow(self.peak_label)
+        f.addRow(self.go_peak_btn)
+        cl.addWidget(g)
+
+        # Manual jogs (same directions as the main GUI's "Manually Move Zabers")
+        g = QGroupBox("Manual moves")
+        f = QFormLayout(g)
+        self.stage_label = QLabel("—")
+        f.addRow(QLabel("Stage x / y / z (um):"))
+        f.addRow(self.stage_label)
+        self.lens_step = _dspin(0.1, 5000.0, 100.0, 10.0, 1, " um")
+        self.stage_step = _dspin(1.0, 5000.0, 100.0, 50.0, 0, " um")
+        lens_back, lens_fwd = QPushButton("← Back"), QPushButton("→ Forward")
+        lens_back.clicked.connect(lambda: self._jog_lens(-1))
+        lens_fwd.clicked.connect(lambda: self._jog_lens(+1))
+        x_left, x_right = QPushButton("← Left"), QPushButton("→ Right")
+        x_left.clicked.connect(lambda: self._jog_stage(+1, 0, 0))
+        x_right.clicked.connect(lambda: self._jog_stage(-1, 0, 0))
+        y_up, y_down = QPushButton("↑ Up"), QPushButton("↓ Down")
+        y_up.clicked.connect(lambda: self._jog_stage(0, +1, 0))
+        y_down.clicked.connect(lambda: self._jog_stage(0, -1, 0))
+        z_back, z_fwd = QPushButton("← Back"), QPushButton("→ Forward")
+        z_back.clicked.connect(lambda: self._jog_stage(0, 0, -1))
+        z_fwd.clicked.connect(lambda: self._jog_stage(0, 0, +1))
+
+        def pair(a, b):
+            row = QHBoxLayout()
+            row.addWidget(a)
+            row.addWidget(b)
+            return row
+
+        f.addRow("Lens step:", self.lens_step)
+        f.addRow("Lens:", pair(lens_back, lens_fwd))
+        f.addRow("Stage step:", self.stage_step)
+        f.addRow("Stage X:", pair(x_left, x_right))
+        f.addRow("Stage Y:", pair(y_up, y_down))
+        f.addRow("Stage Z:", pair(z_back, z_fwd))
+        cl.addWidget(g)
+        self._lens_jog_btns = [lens_back, lens_fwd]
+        self._stage_jog_btns = [x_left, x_right, y_up, y_down, z_back, z_fwd]
+
+        # Eye-tracker settings (thresholds/exposure for the fake eyes)
+        g = QGroupBox("Eye tracker")
+        v = QVBoxLayout(g)
+        et_settings = QPushButton("Eye tracking settings")
+        et_settings.clicked.connect(self._open_et_config)
+        cam_l, cam_r = QPushButton("Left camera"), QPushButton("Right camera")
+        cam_l.clicked.connect(lambda: self._open_allied("left"))
+        cam_r.clicked.connect(lambda: self._open_allied("right"))
+        restart = QPushButton("Restart eye tracker")
+        restart.clicked.connect(self._restart_eye_tracker)
+        v.addWidget(et_settings)
+        v.addLayout(pair(cam_l, cam_r))
+        v.addWidget(restart)
+        for b in (et_settings, cam_l, cam_r, restart):
+            b.setEnabled(has_eye)
+        cl.addWidget(g)
+        cl.addStretch()
+
+        if has_eye:
+            self.eye_panel.result_updated.connect(self._on_eye_result)
+            self._update_target_marker()
+        return w
 
     # ------------------------------------------------------------------ helpers
 
@@ -536,6 +746,17 @@ class HomodyneTestWindow(QWidget):
         self.reprocess_btn.setEnabled(not busy)
         self.save_btn.setEnabled(not busy and self._last_rec is not None)
         self.stop_btn.setEnabled(busy)
+        idle = connected and not busy
+        has_eye = self.eye_panel is not None
+        has_stage = self.stage is not None
+        for b in self._lens_jog_btns:
+            b.setEnabled(idle)
+        for b in self._stage_jog_btns:
+            b.setEnabled(idle and has_stage)
+        self.move_xy_btn.setEnabled(idle and has_eye and has_stage)
+        self.move_z_btn.setEnabled(idle and has_eye)
+        self.move_xyz_btn.setEnabled(idle and has_eye and has_stage)
+        self.go_peak_btn.setEnabled(idle and self._last_peak_z is not None)
 
     @pyqtSlot(str)
     def _set_status(self, text: str):
@@ -543,7 +764,114 @@ class HomodyneTestWindow(QWidget):
 
     @pyqtSlot(float)
     def _set_position(self, z: float):
+        self._lens_um = z
         self.pos_label.setText(f"{z:.2f}")
+        if self.eye_panel is not None:
+            self.eye_panel.set_lens_position(z)
+
+    @pyqtSlot(float, float, float)
+    def _set_stage_position(self, x: float, y: float, z: float):
+        self.stage_label.setText(f"{x:.1f} / {y:.1f} / {z:.1f}")
+
+    # ------------------------------------------------------------------ positioning
+
+    @pyqtSlot(object)
+    def _on_eye_result(self, res):
+        lp, dc = res.laser_position, res.delta_laser_corner
+        xy = f"{lp[0]:+.3f}, {lp[1]:+.3f} mm" if lp is not None else "— (no pupil)"
+        dcs = f"{dc:+.3f} mm" if dc is not None else "—"
+        self.eye_label.setText(f"laser x/y: {xy}\nΔc: {dcs}")
+
+    def _update_target_marker(self, *_):
+        if self.eye_panel is not None:
+            self.eye_panel.set_target(self.r_mm.value(), self.phi_deg.value())
+
+    def _fresh_eye_result(self):
+        res = self.eye_panel.latest_result(max_age_s=0.3) if self.eye_panel is not None else None
+        if res is None:
+            self._set_status("No recent eye-tracker result (pupil not found?).")
+        return res
+
+    def _move_xy(self) -> bool:
+        """Rig-stage move so the laser lands at (R, phi) in pupil coordinates.
+        Same math, limit and signs as hi_frontend.on_move_xy_polar_clicked."""
+        res = self._fresh_eye_result()
+        if res is None:
+            return False
+        phi = np.deg2rad(self.phi_deg.value())
+        dx_um = (self.r_mm.value() * np.cos(phi) - float(res.laser_position[0])) * 1000.0
+        dy_um = (self.r_mm.value() * np.sin(phi) - float(res.laser_position[1])) * 1000.0
+        mag = float(np.hypot(dx_um, dy_um))
+        if mag > 3500.0:
+            dx_um, dy_um = dx_um * 3500.0 / mag, dy_um * 3500.0 / mag
+            self._set_status(f"XY move {mag / 1000:.2f} mm clamped to 3.5 mm.")
+        self._set_busy(True)
+        self._req_stage_rel.emit(-dx_um, dy_um, 0.0)   # stage +X moves the laser -X
+        return True
+
+    def _move_z(self, retries: int = 0):
+        """Eye-lens move so delta_c reaches the target. Same math, limit and
+        sign as hi_frontend.on_move_z_by_dc_clicked."""
+        res = self.eye_panel.latest_result(max_age_s=0.3) if self.eye_panel is not None else None
+        if res is None or res.delta_laser_corner is None:
+            if retries > 0:
+                QTimer.singleShot(200, lambda: self._move_z(retries - 1))
+                return
+            self._set_status("Move Z: no recent Δc from the eye tracker.")
+            self._set_busy(False)
+            return
+        dz_um = (self.dc_target.value() - float(res.delta_laser_corner)) * 1000.0
+        dz_um = float(np.clip(dz_um, -2000.0, 2000.0))
+        self._set_busy(True)
+        self._req_lens_rel.emit(-dz_um)
+
+    def _move_xyz(self):
+        self._pending_z_after_xy = self._move_xy()
+
+    @pyqtSlot()
+    def _on_move_done(self):
+        if self._pending_z_after_xy:
+            # Δc depends on where the laser sits on the curved cornea, so wait
+            # for eye-tracker results taken after the XY move.
+            self._pending_z_after_xy = False
+            QTimer.singleShot(600, lambda: self._move_z(retries=5))
+            return
+        self._set_busy(False)
+
+    def _jog_lens(self, direction: int):
+        self._set_busy(True)
+        self._req_lens_rel.emit(direction * self.lens_step.value())
+
+    def _jog_stage(self, sx: int, sy: int, sz: int):
+        s = self.stage_step.value()
+        self._set_busy(True)
+        self._req_stage_rel.emit(sx * s, sy * s, sz * s)
+
+    def _go_to_peak(self):
+        if self._last_peak_z is None:
+            return
+        self._set_busy(True)
+        self._req_lens_abs.emit(self._last_peak_z)
+
+    def _open_et_config(self):
+        from brillouin_system.eye_tracker.eye_tracker_config.eye_tracker_config_gui import EyeTrackerConfigDialog
+        EyeTrackerConfigDialog(on_apply=self.eye_panel.set_et_config.emit, parent=self).exec_()
+
+    def _open_allied(self, side: str):
+        from brillouin_system.devices.cameras.allied.allied_config.allied_config_dialog import AlliedConfigDialog
+
+        def apply(cfg):
+            if side == "left":
+                self.eye_panel.set_et_allied_configs.emit(cfg, None)
+            else:
+                self.eye_panel.set_et_allied_configs.emit(None, cfg)
+
+        AlliedConfigDialog(side, apply, parent=self).exec_()
+
+    def _restart_eye_tracker(self):
+        self._set_status("Restarting eye tracker ...")
+        self.eye_panel.restart()
+        self._set_status("Eye tracker restarted.")
 
     def _browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Save folder", self.save_dir.text())
@@ -611,6 +939,13 @@ class HomodyneTestWindow(QWidget):
         self._set_busy(False)
         self._set_status("Done. Not saved yet (press Save recording).")
         self._show(rec)
+        # only live slews feed "move to peak" (never a loaded file from another session)
+        if rec.mode == "slew":
+            self._last_peak_z = self._shown_peak_z
+            self.peak_label.setText(
+                f"Last slew peak: z = {self._last_peak_z:.2f} um" if self._last_peak_z is not None
+                else "Last slew peak: none found")
+            self._set_busy(False)
 
     def _confirm_discard_unsaved(self, action: str) -> bool:
         """True if there is nothing unsaved, or the user agrees to discard it."""
@@ -647,6 +982,7 @@ class HomodyneTestWindow(QWidget):
 
     @pyqtSlot(str)
     def _on_failed(self, msg: str):
+        self._pending_z_after_xy = False
         self._set_busy(False)
         self._set_status(f"Error: {msg}")
         QMessageBox.warning(self, "Acquisition failed", msg)
@@ -710,11 +1046,14 @@ class HomodyneTestWindow(QWidget):
                 lines.append(f"LO balance DC_H/DC_V = {dc[0] / dc[1]:.3f}  (adjust paddles toward 1.0)")
 
         peak = None
+        self._shown_peak_z = None
         if trace is not None:
             edge = int(2 * fs / max(trace.band_hz[0], 1.0))
             lines.append(f"S: median {np.median(trace.s):.4f}, max {np.max(trace.s):.4f} sqrt(V)")
             if rec.mode == "slew":
                 peak = locate_peak(x, trace.s, edge_samples=edge)
+                if peak.found and z is not None:
+                    self._shown_peak_z = peak.x_peak
                 if peak.found:
                     lines.append(f"Surface peak at {xlabel.split()[0]} = {peak.x_peak:.2f} "
                                  f"(SNR {peak.snr:.1f}, S {peak.s_peak:.4f})")
@@ -759,6 +1098,13 @@ class HomodyneTestWindow(QWidget):
         self._thread.quit()
         if not self._thread.wait(15000):
             QMessageBox.warning(self, "Busy", "Worker did not finish; closing anyway.")
+        if self.eye_panel is not None:
+            self.eye_panel.shutdown()
+        if self.stage is not None:
+            try:
+                self.stage.close()     # serial port only; never moves
+            except Exception:
+                pass
         if self.zaber is not None:
             try:
                 self.zaber.close()     # closes the serial port only; never moves
