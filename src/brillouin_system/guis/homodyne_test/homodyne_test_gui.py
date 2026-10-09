@@ -15,7 +15,7 @@ are closed when this GUI exits.
 
 Every acquisition is plotted (raw channels, fringe envelopes, and
 S = sqrt(A_H^2/DC_H + A_V^2/DC_V)). Nothing is saved automatically: "Save
-recording" writes the last acquisition to .npz (load with
+recording" writes the last acquisition's raw data to .h5 (or .npz; load with
 homodyne_recording.load_recording); the GUI asks before discarding an
 unsaved recording.
 """
@@ -630,8 +630,9 @@ class HomodyneTestWindow(QWidget):
             stamp = datetime.fromisoformat(rec.meta["created"]).strftime("%Y%m%d_%H%M%S")
         except (KeyError, ValueError):
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        suggested = Path(self.save_dir.text()) / f"{stamp}_{rec.mode}.npz"
-        path, _ = QFileDialog.getSaveFileName(self, "Save recording", str(suggested), "Recordings (*.npz)")
+        suggested = Path(self.save_dir.text()) / f"{stamp}_{rec.mode}.h5"
+        path, _ = QFileDialog.getSaveFileName(self, "Save recording (raw data)", str(suggested),
+                                              "HDF5 (*.h5);;NumPy (*.npz)")
         if not path:
             return
         try:
@@ -653,7 +654,8 @@ class HomodyneTestWindow(QWidget):
     def _load_file(self):
         if not self._confirm_discard_unsaved("load a file"):
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Load recording", self.save_dir.text(), "Recordings (*.npz)")
+        path, _ = QFileDialog.getOpenFileName(self, "Load recording", self.save_dir.text(),
+                                              "Recordings (*.h5 *.hdf5 *.npz)")
         if not path:
             return
         try:

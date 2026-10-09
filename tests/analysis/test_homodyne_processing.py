@@ -97,8 +97,8 @@ def test_no_surface_reports_not_found():
     assert not locate_peak(z, trace.s, edge_samples=20).found
 
 
-def test_recording_roundtrip(tmp_path):
-    rec = HomodyneRecording(
+def _example_recording():
+    return HomodyneRecording(
         mode="slew",
         values=np.arange(10.0).reshape(2, 5),
         sample_rate_hz=5000.0,
@@ -108,11 +108,33 @@ def test_recording_roundtrip(tmp_path):
         zlog_t_perf=np.array([100.0, 100.001]),
         zlog_z_um=np.array([0.0, 0.4]),
     )
-    out = load_recording(save_recording(rec, tmp_path / "r"))
+
+
+@pytest.mark.parametrize("name", ["r.h5", "r.npz", "r"])
+def test_recording_roundtrip(tmp_path, name):
+    rec = _example_recording()
+    path = save_recording(rec, tmp_path / name)
+    assert path.suffix == (".npz" if name.endswith(".npz") else ".h5")
+    out = load_recording(path)
     np.testing.assert_array_equal(out.values, rec.values)
     assert out.channels == ("ai0", "ai1")
+    assert out.mode == "slew"
     assert out.meta == rec.meta
     np.testing.assert_allclose(out.z_um(), [0.0, 0.08, 0.16, 0.24, 0.32])
+
+
+def test_h5_layout_is_plain_and_self_describing(tmp_path):
+    import h5py
+
+    path = save_recording(_example_recording(), tmp_path / "r.h5")
+    with h5py.File(path, "r") as f:
+        assert f["daq/values"].shape == (2, 5)
+        assert f["daq/values"].attrs["units"] == "V"
+        assert list(f["daq/values"].attrs["channels"]) == ["ai0", "ai1"]
+        np.testing.assert_allclose(f["daq/t_s"][:], np.arange(5) / 5000.0)
+        np.testing.assert_allclose(f["daq/z_um"][:], [0.0, 0.08, 0.16, 0.24, 0.32])
+        assert f.attrs["sample_rate_hz"] == 5000.0
+        assert f.attrs["speed_um_s"] == 400.0  # scalar meta exposed as attrs
 
 
 def test_daq_validation_enforces_aggregate_rate():
