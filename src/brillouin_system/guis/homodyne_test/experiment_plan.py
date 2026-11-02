@@ -75,3 +75,66 @@ def radii_range(start_mm: float, stop_mm: float, step_mm: float) -> list[float]:
     if n < 1:
         raise ValueError("Radius stop must be >= start")
     return [round(start_mm + i * step_mm, 6) for i in range(n)]
+
+
+# ---------------------------------------------------------------- stage-referenced radial run
+#
+# No eye tracking: the user marks the apex ("center") and an outer point
+# ("edge") by hand, each as the rig-stage XY plus the eye-lens z of the
+# reflection plane there. Radii run along the straight stage line from center
+# to edge, and the lens z at each radius comes from the sphere through the
+# two planes (apex at the center, rotationally symmetric about it).
+
+MAX_STAGE_STEP_UM = 10000.0     # refuse any single stage move larger than this
+
+
+@dataclass(frozen=True)
+class StageRef:
+    stage_x_um: float
+    stage_y_um: float
+    stage_z_um: float
+    lens_um: float              # eye-lens z of the reflection plane here
+
+
+def stage_ref_distance_mm(center: StageRef, edge: StageRef) -> float:
+    """In-plane stage distance from center to edge [mm]."""
+    return float(np.hypot(edge.stage_x_um - center.stage_x_um, edge.stage_y_um - center.stage_y_um)) / 1000.0
+
+
+def stage_ref_radii(center: StageRef, edge: StageRef, step_mm: float) -> list[float]:
+    """0, step, 2*step, ... up to the edge; the edge itself is always the last radius."""
+    d = stage_ref_distance_mm(center, edge)
+    if d <= 0.0:
+        raise ValueError("Center and edge are at the same stage XY")
+    radii = radii_range(0.0, d, step_mm)
+    if d - radii[-1] > 1e-6:
+        radii.append(round(d, 6))
+    return radii
+
+
+def stage_ref_sphere_radius_mm(center: StageRef, edge: StageRef) -> Optional[float]:
+    """Radius [mm] of the sphere whose apex is the center plane and that passes
+    through the edge plane: R = (r^2 + s^2) / (2 s), s = sag. None if flat (|s| < 1 um)."""
+    r = stage_ref_distance_mm(center, edge)
+    s = abs(edge.lens_um - center.lens_um) / 1000.0
+    if s < 1e-3:
+        return None
+    return (r * r + s * s) / (2.0 * s)
+
+
+def stage_ref_lens_um(center: StageRef, edge: StageRef, r_mm: float) -> float:
+    """Predicted eye-lens z of the reflection plane at radius r_mm (sphere model,
+    same sign as edge - center; flat surface -> center z)."""
+    R = stage_ref_sphere_radius_mm(center, edge)
+    if R is None:
+        return center.lens_um
+    r = min(abs(float(r_mm)), R)
+    sag_um = 1000.0 * (R - np.sqrt(R * R - r * r))
+    return center.lens_um + float(np.sign(edge.lens_um - center.lens_um)) * sag_um
+
+
+def stage_ref_xy_um(center: StageRef, edge: StageRef, r_mm: float) -> tuple[float, float]:
+    """Absolute rig-stage XY [um] for radius r_mm on the center -> edge line."""
+    f = float(r_mm) / stage_ref_distance_mm(center, edge)
+    return (center.stage_x_um + f * (edge.stage_x_um - center.stage_x_um),
+            center.stage_y_um + f * (edge.stage_y_um - center.stage_y_um))

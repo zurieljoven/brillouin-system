@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from brillouin_system.guis.homodyne_test.experiment_plan import (
@@ -63,3 +64,54 @@ def test_repeat_steps_alternate_fwd_bwd():
     assert sum(s.direction == "fwd" for s in steps) == 50
     assert all(s.r_mm is None for s in steps)
     assert (steps[-1].loop, steps[-1].direction) == (50, "bwd")
+
+
+def _refs(r_edge_mm=6.5, R_mm=12.7, angle_deg=30.0):
+    from brillouin_system.guis.homodyne_test.experiment_plan import StageRef
+
+    a = np.deg2rad(angle_deg)
+    center = StageRef(12000.0, 10000.0, 12000.0, 14000.0)
+    sag_um = 1000.0 * (R_mm - np.sqrt(R_mm ** 2 - r_edge_mm ** 2))
+    edge = StageRef(12000.0 + 1000.0 * r_edge_mm * np.cos(a), 10000.0 + 1000.0 * r_edge_mm * np.sin(a),
+                    12000.0, 14000.0 + sag_um)
+    return center, edge
+
+
+def test_stage_ref_radii_end_at_edge():
+    from brillouin_system.guis.homodyne_test.experiment_plan import stage_ref_radii
+
+    center, edge = _refs(r_edge_mm=6.5)
+    radii = stage_ref_radii(center, edge, 0.5)
+    assert radii[0] == 0.0 and radii[-1] == pytest.approx(6.5) and len(radii) == 14
+    center, edge = _refs(r_edge_mm=6.3)
+    radii = stage_ref_radii(center, edge, 0.5)
+    assert radii[-2] == pytest.approx(6.0) and radii[-1] == pytest.approx(6.3)
+    with pytest.raises(ValueError):
+        stage_ref_radii(center, center, 0.5)
+
+
+def test_stage_ref_sphere_recovers_radius_and_sag():
+    from brillouin_system.guis.homodyne_test.experiment_plan import (
+        stage_ref_lens_um, stage_ref_sphere_radius_mm, stage_ref_xy_um,
+    )
+
+    center, edge = _refs(r_edge_mm=6.5, R_mm=12.7)
+    assert stage_ref_sphere_radius_mm(center, edge) == pytest.approx(12.7)
+    assert stage_ref_lens_um(center, edge, 0.0) == pytest.approx(center.lens_um)
+    assert stage_ref_lens_um(center, edge, 6.5) == pytest.approx(edge.lens_um)
+    assert stage_ref_lens_um(center, edge, 4.0) - center.lens_um == pytest.approx(1000 * (12.7 - np.sqrt(12.7 ** 2 - 16)))
+    x, y = stage_ref_xy_um(center, edge, 3.25)                      # halfway along the line
+    assert x == pytest.approx(0.5 * (center.stage_x_um + edge.stage_x_um))
+    assert y == pytest.approx(0.5 * (center.stage_y_um + edge.stage_y_um))
+
+
+def test_stage_ref_flat_and_negative_sag():
+    from brillouin_system.guis.homodyne_test.experiment_plan import StageRef, stage_ref_lens_um, stage_ref_sphere_radius_mm
+
+    center = StageRef(0.0, 0.0, 0.0, 14000.0)
+    flat = StageRef(5000.0, 0.0, 0.0, 14000.0)
+    assert stage_ref_sphere_radius_mm(center, flat) is None
+    assert stage_ref_lens_um(center, flat, 2.0) == 14000.0
+    down = StageRef(5000.0, 0.0, 0.0, 13000.0)                      # edge plane at lower lens z
+    assert stage_ref_lens_um(center, down, 5.0) == pytest.approx(13000.0)
+    assert stage_ref_lens_um(center, down, 2.5) < 14000.0

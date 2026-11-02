@@ -43,8 +43,9 @@ from PyQt5.QtWidgets import (
 
 from brillouin_system.devices.ni.ni6008_multi import DIFF_RANGES_V, effective_range_v
 from brillouin_system.guis.homodyne_test.experiment_plan import (
-    MAX_XY_MOVE_UM, ExperimentStep, build_experiment_steps, build_repeat_steps, radii_range, xy_stage_move_um,
-    z_lens_move_um,
+    MAX_STAGE_STEP_UM, MAX_XY_MOVE_UM, ExperimentStep, StageRef, build_experiment_steps, build_repeat_steps,
+    radii_range, stage_ref_distance_mm, stage_ref_lens_um, stage_ref_radii, stage_ref_sphere_radius_mm,
+    stage_ref_xy_um, xy_stage_move_um, z_lens_move_um,
 )
 from brillouin_system.scan_managers.homodyne_processing import (
     fringe_band_hz, fringe_frequency_hz, locate_peak, process_channels,
@@ -88,7 +89,8 @@ class _ExperimentState:
     plan: dict
     steps: list
     run_dir: Path
-    use_eye: bool = True        # False: repeat run, no eye-tracking moves
+    use_eye: bool = True        # False: repeat run or stage-referenced run, no eye-tracking moves
+    mode: str = "eye"           # "eye" | "repeat" | "stage_ref"
     i: int = 0                  # index of the current step
     phase: str = ""             # "xy_move" | "z_move" | "slew"
     xy_moves: int = 0
@@ -307,6 +309,9 @@ class HomodyneTestWindow(QWidget):
         self._pending_z_after_xy = False
         self._exp: Optional[_ExperimentState] = None
         self._stage_xyz: Optional[tuple[float, float, float]] = None
+        self._center_ref: Optional[StageRef] = None     # stage-referenced run: apex
+        self._edge_ref: Optional[StageRef] = None       # stage-referenced run: outer point
+        self._pending_ref: Optional[str] = None         # "center" | "edge": capture on the next position read
         self._shown_peak = None
         self._shown_peak_z: Optional[float] = None
 
@@ -742,6 +747,52 @@ class HomodyneTestWindow(QWidget):
         cl.addWidget(g)
         self._exp_update_info()
 
+        # Stage-referenced radial run: center and edge marked by hand, no eye tracking
+        g = QGroupBox("Stage-referenced radial run (no eye tracking)")
+        f = QFormLayout(g)
+        f.addRow(QLabel("Put the lens on the reflection plane at the apex and press Set center, then "
+                        "move the stage to the outermost point, find its plane and press Set edge. "
+                        "Radii run along the stage line from center to edge; the lens z at each "
+                        "radius comes from the sphere through the two planes."))
+        self.sr_center_btn = QPushButton("Set center")
+        self.sr_center_btn.setToolTip("Store the current rig-stage XY and eye-lens z as the apex (R = 0).")
+        self.sr_center_btn.clicked.connect(lambda: self._sr_capture("center"))
+        self.sr_edge_btn = QPushButton("Set edge")
+        self.sr_edge_btn.setToolTip("Store the current rig-stage XY and eye-lens z as the outermost radius.")
+        self.sr_edge_btn.clicked.connect(lambda: self._sr_capture("edge"))
+        self.sr_center_label = QLabel("Center: —")
+        self.sr_edge_label = QLabel("Edge: —")
+        self.sr_geom_label = QLabel("")
+        for lbl in (self.sr_center_label, self.sr_edge_label, self.sr_geom_label):
+            lbl.setStyleSheet("font-family: monospace;")
+        self.sr_dr = _dspin(0.01, 10.0, 0.5, 0.1, 2, " mm")
+        self.sr_loops = QSpinBox()
+        self.sr_loops.setRange(1, 100)
+        self.sr_loops.setValue(5)
+        self.sr_half = _dspin(10.0, MAX_RANGE_UM / 2, 400.0, 50.0, 0, " um")
+        self.sr_half.setToolTip("Each slew covers predicted plane ± this (fwd: back off -, slew +; bwd: mirrored).")
+        self.sr_info = QLabel()
+        self.sr_info.setWordWrap(True)
+        self.sr_btn = QPushButton("Start stage-referenced run")
+        self.sr_btn.clicked.connect(self._sr_start)
+        for wdg in (self.sr_dr, self.sr_half, self.speed):
+            wdg.valueChanged.connect(self._sr_update_info)
+        self.sr_loops.valueChanged.connect(self._sr_update_info)
+        f.addRow(pair(self.sr_center_btn, self.sr_edge_btn))
+        f.addRow(self.sr_center_label)
+        f.addRow(self.sr_edge_label)
+        f.addRow(self.sr_geom_label)
+        f.addRow("R step:", self.sr_dr)
+        f.addRow("Loops:", self.sr_loops)
+        f.addRow("Scan ± plane:", self.sr_half)
+        f.addRow(QLabel("Uses the shutter options above."))
+        f.addRow(self.sr_info)
+        f.addRow(self.sr_btn)
+        for lbl in g.findChildren(QLabel):
+            lbl.setWordWrap(True)
+        cl.addWidget(g)
+        self._sr_update_info()
+
         # Repeat slews at a fixed position (e.g. water cuvette): no eye tracking
         g = QGroupBox("Repeat slews (no eye tracking)")
         f = QFormLayout(g)
@@ -858,6 +909,9 @@ class HomodyneTestWindow(QWidget):
         self.go_peak_btn.setEnabled(idle and self._last_peak_z is not None)
         self.exp_btn.setEnabled(idle and has_eye and has_stage)
         self.rep_btn.setEnabled(idle)
+        self.sr_center_btn.setEnabled(idle and has_stage)
+        self.sr_edge_btn.setEnabled(idle and has_stage)
+        self.sr_btn.setEnabled(idle and has_stage and self._center_ref is not None and self._edge_ref is not None)
 
     @pyqtSlot(str)
     def _set_status(self, text: str):
@@ -874,6 +928,8 @@ class HomodyneTestWindow(QWidget):
     def _set_stage_position(self, x: float, y: float, z: float):
         self._stage_xyz = (x, y, z)
         self.stage_label.setText(f"{x:.1f} / {y:.1f} / {z:.1f}")
+        if self._pending_ref is not None:
+            self._sr_store(self._pending_ref)
 
     # ------------------------------------------------------------------ positioning
 
@@ -983,7 +1039,7 @@ class HomodyneTestWindow(QWidget):
     EXP_SETTLE_MS = 600         # after a move, wait for eye frames taken at the new position
     EXP_LOG_FIELDS = ["step", "loop", "r_target_mm", "phi_target_deg", "direction", "file", "status",
                       "laser_x_mm", "laser_y_mm", "xy_err_mm", "xy_moves", "dc_mm", "lens_start_um",
-                      "stage_x_um", "stage_y_um", "stage_z_um", "peak_z_um", "peak_snr", "time"]
+                      "stage_x_um", "stage_y_um", "stage_z_um", "lens_pred_um", "peak_z_um", "peak_snr", "time"]
 
     def _exp_plan(self) -> dict:
         return {
@@ -1031,7 +1087,7 @@ class HomodyneTestWindow(QWidget):
                         motion="The rig stage and eye lens will move.")
 
     def _exp_begin(self, plan: dict, steps: list, prefix: str, *, use_eye: bool,
-                   description: str, motion: str):
+                   description: str, motion: str, mode: Optional[str] = None):
         """Shared start for the eye-tracking experiment and the repeat run."""
         if not self._confirm_discard_unsaved("start the run"):
             return
@@ -1052,11 +1108,128 @@ class HomodyneTestWindow(QWidget):
             QMessageBox.warning(self, "Experiment", f"Cannot create the run folder: {e}")
             return
 
-        self._exp = _ExperimentState(plan=plan, steps=steps, run_dir=run_dir, use_eye=use_eye)
+        self._exp = _ExperimentState(plan=plan, steps=steps, run_dir=run_dir, use_eye=use_eye,
+                                     mode=mode or ("eye" if use_eye else "repeat"))
         self._set_busy(True)
         if self.exp_open_shutter.isChecked() and self.shutters is not None:
             self._open_sample_shutter()
         self._exp_next()
+
+    # ------------------------------------------------------------------ stage-referenced run
+    #
+    # Per step: absolute rig-stage XY move to the point at radius R on the
+    # center -> edge line (stage Z is never moved), absolute eye-lens move to
+    # the predicted plane, slew over plane +- half window (returns to the
+    # predicted plane), save, log. Steps and file names as in the eye run.
+
+    def _sr_capture(self, which: str):
+        """Read fresh stage and lens positions, then store them as center/edge."""
+        self._pending_ref = which
+        self._req_position.emit()
+
+    def _sr_store(self, which: str):
+        self._pending_ref = None
+        if self._stage_xyz is None or self._lens_um is None:
+            self._set_status(f"Set {which}: no stage or lens position yet.")
+            return
+        ref = StageRef(*self._stage_xyz, lens_um=self._lens_um)
+        if which == "center":
+            self._center_ref = ref
+        else:
+            self._edge_ref = ref
+        label = self.sr_center_label if which == "center" else self.sr_edge_label
+        label.setText(f"{which.capitalize()}: stage {ref.stage_x_um:.1f} / {ref.stage_y_um:.1f} / "
+                      f"{ref.stage_z_um:.1f} um, lens {ref.lens_um:.1f} um")
+        self._set_status(f"{which.capitalize()} set.")
+        self._sr_update_info()
+        self._set_busy(self._busy)
+
+    def _sr_plan(self) -> dict:
+        c, e = self._center_ref, self._edge_ref
+        if c is None or e is None:
+            raise ValueError("Set the center and the edge first.")
+        radii = stage_ref_radii(c, e, self.sr_dr.value())
+        R = stage_ref_sphere_radius_mm(c, e)
+        return {
+            "mode": "stage_ref",
+            "center": asdict(c),
+            "edge": asdict(e),
+            "edge_r_mm": stage_ref_distance_mm(c, e),
+            "line_angle_deg": float(np.degrees(np.arctan2(e.stage_y_um - c.stage_y_um, e.stage_x_um - c.stage_x_um))),
+            "sphere_radius_mm": R,
+            "radii_mm": radii,
+            "lens_pred_um": [stage_ref_lens_um(c, e, r) for r in radii],
+            "n_loops": self.sr_loops.value(),
+            "half_window_um": self.sr_half.value(),
+            "speed_um_s": self.speed.value(),
+        }
+
+    def _sr_update_info(self, *_):
+        try:
+            p = self._sr_plan()
+        except ValueError as ex:
+            self.sr_geom_label.setText("")
+            self.sr_info.setText(str(ex))
+            return
+        c, e = self._center_ref, self._edge_ref
+        R = p["sphere_radius_mm"]
+        lines = [f"edge R {p['edge_r_mm']:.3f} mm, sag {e.lens_um - c.lens_um:+.1f} um",
+                 f"sphere R {R:.2f} mm" if R is not None else "flat (sag < 1 um)"]
+        if R is not None and p["edge_r_mm"] <= R:
+            lines.append(f"edge tilt {np.degrees(np.arcsin(p['edge_r_mm'] / R)):.1f} deg")
+        if abs(e.stage_z_um - c.stage_z_um) > 1.0:
+            lines.append(f"WARNING stage Z differs by {e.stage_z_um - c.stage_z_um:+.1f} um (only X/Y move)")
+        self.sr_geom_label.setText("\n".join(lines))
+        n_r = len(p["radii_mm"])
+        n = 2 * n_r * p["n_loops"]
+        # slew time + ~5 s per slew for the stage/lens moves, back-off and return
+        t = n * 2.0 * p["half_window_um"] / p["speed_um_s"] + 5.0 * n
+        self.sr_info.setText(f"{n} slews ({n_r} radii x 2 directions x {p['n_loops']} loops), "
+                             f"roughly {t / 60:.0f} min at {p['speed_um_s']:.0f} um/s.")
+
+    def _sr_start(self):
+        if self._exp is not None:
+            return
+        if self.stage is None or self._worker is None:
+            QMessageBox.warning(self, "Stage-referenced run", "Needs the rig stage, the eye lens and the DAQ.")
+            return
+        try:
+            plan = self._sr_plan()
+            self._daq_settings_validated()
+            fringe_band_hz(plan["speed_um_s"], self.wavelength.value(), float(self.fs.value()))
+        except ValueError as ex:
+            QMessageBox.warning(self, "Stage-referenced run", str(ex))
+            return
+        self._exp_begin(plan, build_experiment_steps(plan["radii_mm"], plan["n_loops"]), "stage_ref",
+                        use_eye=False, mode="stage_ref", description=self.sr_info.text(),
+                        motion="The rig stage (X/Y only) and the eye lens will move.")
+
+    def _sr_xy(self):
+        e = self._exp
+        s = e.steps[e.i]
+        c, ed = self._center_ref, self._edge_ref
+        e.snapshot["lens_pred_um"] = stage_ref_lens_um(c, ed, s.r_mm)
+        tx, ty = stage_ref_xy_um(c, ed, s.r_mm)
+        if self._stage_xyz is None:
+            self._exp_on_failed("no rig-stage position")
+            return
+        dx, dy = tx - self._stage_xyz[0], ty - self._stage_xyz[1]
+        if max(abs(dx), abs(dy)) > MAX_STAGE_STEP_UM:
+            self._exp_on_failed(f"stage move ({dx:+.0f}, {dy:+.0f}) um exceeds {MAX_STAGE_STEP_UM:.0f} um")
+            return
+        if abs(dx) < 0.5 and abs(dy) < 0.5:
+            self._sr_z()
+            return
+        e.phase = "sr_xy"
+        self._req_stage_rel.emit(dx, dy, 0.0)
+
+    def _sr_z(self):
+        e = self._exp
+        if e.abort:
+            self._exp_finish()
+            return
+        e.phase = "sr_z"
+        self._req_lens_abs.emit(e.snapshot["lens_pred_um"])
 
     def _rep_plan(self) -> dict:
         return {
@@ -1105,7 +1278,7 @@ class HomodyneTestWindow(QWidget):
             "laser_x_mm": snap.get("laser_x_mm"), "laser_y_mm": snap.get("laser_y_mm"),
             "xy_err_mm": snap.get("xy_err_mm"), "xy_moves": snap.get("xy_moves", e.xy_moves),
             "dc_mm": snap.get("dc_mm"), "lens_start_um": snap.get("lens_start_um"),
-            "stage_x_um": sx, "stage_y_um": sy, "stage_z_um": sz,
+            "stage_x_um": sx, "stage_y_um": sy, "stage_z_um": sz, "lens_pred_um": snap.get("lens_pred_um"),
             "peak_z_um": peak.x_peak if peak is not None and peak.found else None,
             "peak_snr": peak.snr if peak is not None else None,
             "time": datetime.now().isoformat(timespec="seconds"),
@@ -1125,6 +1298,11 @@ class HomodyneTestWindow(QWidget):
         e.snapshot = {}
         e.eye_wait_s = 0.0
         word = "forward" if s.direction == "fwd" else "backward"
+        if e.mode == "stage_ref":
+            self._set_status(f"Stage-referenced step {e.i + 1}/{len(e.steps)}: loop {s.loop}, "
+                             f"R = {s.r_mm:.2f} mm, {word}")
+            self._sr_xy()
+            return
         if not e.use_eye:
             self._set_status(f"Repeat slew {e.i + 1}/{len(e.steps)}: pair {s.loop}, {word}")
             self._exp_slew(None)
@@ -1188,6 +1366,10 @@ class HomodyneTestWindow(QWidget):
         elif e.phase == "z_move":
             QTimer.singleShot(self.EXP_SETTLE_MS,
                               lambda: self._exp_with_eye(self._exp_slew, need_dc=True))
+        elif e.phase == "sr_xy":
+            self._sr_z()
+        elif e.phase == "sr_z":
+            QTimer.singleShot(int(1000 * SETTLE_S), lambda: self._exp_slew(None))
 
     def _exp_slew(self, res):
         e = self._exp
@@ -1199,9 +1381,14 @@ class HomodyneTestWindow(QWidget):
             e.snapshot.update(laser_x_mm=float(lp[0]), laser_y_mm=float(lp[1]),
                               dc_mm=float(res.delta_laser_corner), xy_moves=e.xy_moves)
         fwd = s.direction == "fwd"
+        if e.mode == "stage_ref":      # predicted plane +- half window, both directions
+            backoff, rng = p["half_window_um"], 2.0 * p["half_window_um"]
+        else:
+            backoff = p["fwd_backoff_um"] if fwd else p["bwd_backoff_um"]
+            rng = p["fwd_range_um"] if fwd else p["bwd_range_um"]
         settings = SlewSettings(
-            backoff_um=p["fwd_backoff_um"] if fwd else p["bwd_backoff_um"],
-            range_um=p["fwd_range_um"] if fwd else p["bwd_range_um"],
+            backoff_um=backoff,
+            range_um=rng,
             speed_um_s=p["speed_um_s"],
             reverse=not fwd,
             return_to_start=True,
@@ -1211,7 +1398,8 @@ class HomodyneTestWindow(QWidget):
                     experiment=e.run_dir.name, step=e.i + 1, loop=s.loop, scan_direction=s.direction,
                     **({"r_target_mm": s.r_mm, "phi_target_deg": p["phi_deg"],
                         "dc_target_mm": p["dc_target_mm"]} if e.use_eye else {}),
-                    **{f"eye_{k}": v for k, v in e.snapshot.items() if v is not None})
+                    **({"r_target_mm": s.r_mm, "mode": "stage_ref"} if e.mode == "stage_ref" else {}),
+                    **{(k if e.mode == "stage_ref" else f"eye_{k}"): v for k, v in e.snapshot.items() if v is not None})
         e.phase = "slew"
         self._req_slew.emit(self._daq_settings(), settings, meta)
 
@@ -1267,7 +1455,8 @@ class HomodyneTestWindow(QWidget):
         if self.exp_close_shutter.isChecked() and self.shutters is not None:
             self._close_shutters()
         word = "stopped" if e.abort else "finished"
-        self._set_status(f"{'Experiment' if e.use_eye else 'Repeat run'} {word}: {e.n_ok} slews saved, {e.n_fail} skipped/failed, "
+        kind = {"eye": "Experiment", "repeat": "Repeat run", "stage_ref": "Stage-referenced run"}[e.mode]
+        self._set_status(f"{kind} {word}: {e.n_ok} slews saved, {e.n_fail} skipped/failed, "
                          f"{len(e.steps) - e.i} not run. Folder: {e.run_dir}")
         self._set_busy(False)
 
