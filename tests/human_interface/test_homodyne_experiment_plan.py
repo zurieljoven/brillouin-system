@@ -115,3 +115,11 @@ def test_stage_ref_flat_and_negative_sag():
     down = StageRef(5000.0, 0.0, 0.0, 13000.0)                      # edge plane at lower lens z
     assert stage_ref_lens_um(center, down, 5.0) == pytest.approx(13000.0)
     assert stage_ref_lens_um(center, down, 2.5) < 14000.0
+
+
+def test_stage_ref_radii_no_duplicate_edge_from_readback_jitter():
+    from brillouin_system.guis.homodyne_test.experiment_plan import StageRef, stage_ref_radii
+    c = StageRef(10500.0, 10700.0, 0.0, 900.0)
+    e = StageRef(13250.01, 10700.0, 0.0, 1450.0)  # 2.75001 mm
+    radii = stage_ref_radii(c, e, 0.25)
+    assert len(radii) == 12 and radii[-1] == pytest.approx(2.75001) and radii[-2] == pytest.approx(2.5)

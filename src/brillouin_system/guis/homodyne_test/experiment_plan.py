@@ -102,12 +102,16 @@ def stage_ref_distance_mm(center: StageRef, edge: StageRef) -> float:
 
 
 def stage_ref_radii(center: StageRef, edge: StageRef, step_mm: float) -> list[float]:
-    """0, step, 2*step, ... up to the edge; the edge itself is always the last radius."""
+    """0, step, 2*step, ... up to the edge; the edge itself is always the last radius.
+    A grid radius within a quarter step of the edge is replaced by the edge (stage
+    readback jitter makes the edge e.g. 2.75001 mm, which must not add a second edge)."""
     d = stage_ref_distance_mm(center, edge)
     if d <= 0.0:
         raise ValueError("Center and edge are at the same stage XY")
     radii = radii_range(0.0, d, step_mm)
-    if d - radii[-1] > 1e-6:
+    if len(radii) > 1 and d - radii[-1] < 0.25 * step_mm:
+        radii.pop()
+    if not radii or d - radii[-1] > 1e-6:
         radii.append(round(d, 6))
     return radii
 
