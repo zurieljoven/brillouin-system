@@ -55,8 +55,11 @@ def config(plane, **kw):
 def test_full_run_saves_every_trial_and_finds_the_plane(tmp_path):
     dev, plane = rig()
     run = tmp_path / "run"
-    counts = run_experiment(dev, config(plane), run, threading.Event())
+    shown = []
+    counts = run_experiment(dev, config(plane), run, threading.Event(), on_frame=lambda f, z: shown.append((f, z)))
     assert counts == dict(n_done=6, n_found=4, n_missed=0, n_axial=2)
+    assert len(shown) == 2 * 7     # every axial frame reaches the display, with its z
+    assert shown[0][0].ndim == 2 and shown[0][1] == pytest.approx(plane - 60.0, abs=2.0)
 
     rows = list(csv.DictReader(open(run / "run_log.csv")))
     assert len(rows) == 6

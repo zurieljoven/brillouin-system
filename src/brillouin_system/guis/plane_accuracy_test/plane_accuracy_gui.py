@@ -16,24 +16,28 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import pyqtgraph as pg
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PyQt5.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import (
     QCheckBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-    QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
+    QPlainTextEdit, QPushButton, QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from brillouin_system.guis.homodyne_test.experiment_plan import (
     StageRef, stage_ref_distance_mm, stage_ref_sphere_radius_mm,
 )
 from brillouin_system.guis.plane_accuracy_test.runner import (
-    Devices, RunConfig, open_sample_path, run_experiment, run_find,
+    Cancelled, Devices, RunConfig, move_lens_from_below, open_sample_path, run_axial, run_experiment, run_find,
 )
 from brillouin_system.scan_managers.homodyne_plane_finder import HomodyneFinderParams
 from brillouin_system.scan_managers.homodyne_processing import process_channels
+from brillouin_system.spectrum_fitting.spectrum_fitter import SpectrumFitter
 
 DEFAULT_SAVE_DIR = Path.home() / "plane_accuracy_runs"
+SATURATION_COUNTS = 60000.0     # the iXon digitizes to 16 bits
+MAX_SUM_POINTS = 2000
 
 
 def connect_devices(use_dummy: bool, lens_port: str, stage_port: str, ni_device: str) -> Devices:
@@ -74,6 +78,7 @@ class Worker(QObject):
     connected = pyqtSignal(str)                           # error text, empty when fine
     done = pyqtSignal()
     trace = pyqtSignal(object, object)                    # row or None, recording
+    frame = pyqtSignal(object, float, bool)               # Andor frame, lens z [um], live view
     run_finished = pyqtSignal(str)
     failed = pyqtSignal(str)
 
@@ -117,6 +122,37 @@ class Worker(QObject):
     def set_shutter(self, is_open: bool):
         self._guarded(lambda: open_sample_path(self.dev.shutters) if is_open else self.dev.shutters.close_all())
 
+    @pyqtSlot(float, int, bool)
+    def snap(self, exposure_s: float, gain: int, live: bool):
+        try:
+            self.dev.camera.set_exposure_time(exposure_s)
+            self.dev.camera.set_emccd_gain(gain)
+            frame = np.asarray(self.dev.camera.snap())
+            self.frame.emit(frame, float(self.dev.lens.get_position()), live)
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+            self.frame.emit(None, 0.0, False)
+
+    @pyqtSlot(float, int, float, float, float)
+    def scan_here(self, exposure_s: float, gain: int, before_um: float, after_um: float, step_um: float):
+        """Andor frames stepping through the current z, then back to it. Saves nothing."""
+        def go():
+            self.stop.clear()
+            z0 = float(self.dev.lens.get_position())
+            self.dev.camera.set_exposure_time(exposure_s)
+            self.dev.camera.set_emccd_gain(gain)
+            try:
+                run_axial(self.dev, before_um, after_um, step_um, z0, {}, self.stop,
+                          lambda f, z: self.frame.emit(f, z, False))
+            except Cancelled:
+                pass
+            move_lens_from_below(self.dev.lens, z0)
+        self._guarded(go)
+
+    @pyqtSlot(float)
+    def move_lens_to(self, z_um: float):
+        self._guarded(lambda: move_lens_from_below(self.dev.lens, z_um))
+
     @pyqtSlot(float, object, float)
     def find_manual(self, direction: float, params: HomodyneFinderParams, half_um: float):
         """Search around the current z and leave the lens on the plane (back at the start on a miss)."""
@@ -138,7 +174,8 @@ class Worker(QObject):
         self.stop.clear()
         try:
             counts = run_experiment(self.dev, cfg, run_dir, self.stop, on_status=self.status.emit,
-                                    on_trial=lambda row, rec: self.trace.emit(row, rec))
+                                    on_trial=lambda row, rec: self.trace.emit(row, rec),
+                                    on_frame=lambda f, z: self.frame.emit(f, z, False))
             word = "stopped" if self.stop.is_set() else "finished"
             self.run_finished.emit(f"Run {word}: {counts['n_done']} trials, {counts['n_found']} found, "
                                    f"{counts['n_missed']} missed, {counts['n_axial']} axial scans. Folder: {run_dir}")
@@ -176,6 +213,9 @@ class PlaneAccuracyWindow(QWidget):
     _req_stage = pyqtSignal(float, float)
     _req_lens = pyqtSignal(float)
     _req_shutter = pyqtSignal(bool)
+    _req_snap = pyqtSignal(float, int, bool)
+    _req_scan = pyqtSignal(float, int, float, float, float)
+    _req_lens_to = pyqtSignal(float)
     _req_find = pyqtSignal(float, object, float)
     _req_run = pyqtSignal(object, object)
     _req_shutdown = pyqtSignal()
@@ -200,12 +240,16 @@ class PlaneAccuracyWindow(QWidget):
         self._worker.connected.connect(self._on_connected)
         self._worker.done.connect(lambda: self._set_busy(False))
         self._worker.trace.connect(self._on_trace)
+        self._worker.frame.connect(self._on_frame)
         self._worker.run_finished.connect(self._on_run_finished)
         self._worker.failed.connect(self._on_failed)
         self._req_connect.connect(self._worker.connect_all)
         self._req_stage.connect(self._worker.jog_stage)
         self._req_lens.connect(self._worker.jog_lens)
         self._req_shutter.connect(self._worker.set_shutter)
+        self._req_snap.connect(self._worker.snap)
+        self._req_scan.connect(self._worker.scan_here)
+        self._req_lens_to.connect(self._worker.move_lens_to)
         self._req_find.connect(self._worker.find_manual)
         self._req_run.connect(self._worker.run)
         self._req_shutdown.connect(self._worker.shutdown)
@@ -258,6 +302,27 @@ class PlaneAccuracyWindow(QWidget):
             b = QPushButton(text)
             b.clicked.connect(lambda _, x=d: self._find(x))
             row.addWidget(b)
+        f.addRow(row)
+        row = QHBoxLayout()
+        self.snap_btn = QPushButton("Snap Andor")
+        self.snap_btn.clicked.connect(self._snap)
+        self.live_btn = QPushButton("Live Andor")
+        self.live_btn.setCheckable(True)
+        self.live_btn.toggled.connect(self._toggle_live)
+        self.scan_btn = QPushButton("Andor scan through here")
+        self.scan_btn.setToolTip("Frames from the axial before/after/step settings below, then back to this z.")
+        self.scan_btn.clicked.connect(self._scan_here)
+        row.addWidget(self.snap_btn)
+        row.addWidget(self.live_btn)
+        row.addWidget(self.scan_btn)
+        f.addRow(row)
+        row = QHBoxLayout()
+        self.brightest_btn = QPushButton("Move lens to brightest")
+        self.brightest_btn.clicked.connect(self._move_to_brightest)
+        self.clear_sum_btn = QPushButton("Clear summed plot")
+        self.clear_sum_btn.clicked.connect(self._clear_sum)
+        row.addWidget(self.brightest_btn)
+        row.addWidget(self.clear_sum_btn)
         f.addRow(row)
         cl.addWidget(g)
 
@@ -326,19 +391,69 @@ class PlaneAccuracyWindow(QWidget):
         cl.addStretch()
 
         right = QVBoxLayout()
-        self.fig = Figure(figsize=(9, 7), tight_layout=True)
+        right.addWidget(self._build_camera_view(), 5)
+        self.sum_label = QLabel("Summed intensity: —")
+        self.sum_label.setStyleSheet("font-family: monospace; font-weight: bold;")
+        right.addWidget(self.sum_label)
+        row = QHBoxLayout()
+        self.frame_slider = QSlider(Qt.Horizontal)
+        self.frame_slider.setEnabled(False)
+        self.frame_slider.valueChanged.connect(self._show_axial_frame)
+        self.frame_slider_label = QLabel("Last axial scan: none yet")
+        row.addWidget(self.frame_slider_label)
+        row.addWidget(self.frame_slider, 1)
+        right.addLayout(row)
+        self.fig = Figure(figsize=(9, 2.6), tight_layout=True)
         self.canvas = FigureCanvasQTAgg(self.fig)
-        self.ax_s = self.fig.add_subplot(311)
-        self.ax_axial = self.fig.add_subplot(312)
-        self.ax_err = self.fig.add_subplot(313)
-        right.addWidget(self.canvas, 3)
+        self.ax_s = self.fig.add_subplot(121)
+        self.ax_err = self.fig.add_subplot(122)
+        right.addWidget(self.canvas, 2)
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         right.addWidget(self.log_box, 1)
         root.addLayout(right, 1)
         self._controls = [w for w in panel.findChildren(QPushButton) if w is not self.stop_btn]
         self._err = {"find_fwd": ([], []), "find_bwd": ([], []), "axial": ([], [])}
+        self._last_axial = None
+        self._fitter = SpectrumFitter()     # the human interface's spectrum: same row band and pixel offsets
+        self._sum_z: list[float] = []
+        self._sum_v: list[float] = []
+        self._snap_pending = False
+        self._current_sum: Optional[tuple[float, float]] = None
         self._update_info()
+
+    def _build_camera_view(self) -> pg.GraphicsLayoutWidget:
+        """Image and spectrum as in the human interface, plus summed intensity against lens z."""
+        pg.setConfigOptions(useOpenGL=False, antialias=True, imageAxisOrder="row-major", background="w", foreground="k")
+        self.glw = pg.GraphicsLayoutWidget()
+        ci = self.glw.ci
+        ci.setSpacing(12)
+        ci.setContentsMargins(8, 8, 8, 8)
+
+        self.vb_img = self.glw.addViewBox(lockAspect=True, enableMenu=False)
+        self.vb_img.invertY(True)
+        self.img_item = pg.ImageItem(autoDownsample=True)
+        self.vb_img.addItem(self.img_item)
+        self.vb_img.setBorder((170, 170, 170))
+
+        self.glw.nextRow()
+        self.spec_plot = self.glw.addPlot(labels={"left": "Intensity", "bottom": "Pixel (X)"})
+        self.spec_plot.setMenuEnabled(False)
+        self.spec_plot.setTitle("Spectrum", color=(40, 40, 40))
+        self.spec_plot.getViewBox().setBorder((170, 170, 170))
+        self.spec_points = pg.PlotDataItem(pen=None, symbol="o", symbolSize=4, symbolPen=pg.mkPen("k"), symbolBrush="k")
+        self.spec_plot.addItem(self.spec_points)
+
+        self.glw.nextRow()
+        self.sum_plot = self.glw.addPlot(labels={"left": "Summed intensity", "bottom": "Lens z (um)"})
+        self.sum_plot.setMenuEnabled(False)
+        self.sum_plot.setTitle("Summed intensity vs lens z", color=(40, 40, 40))
+        self.sum_plot.getViewBox().setBorder((170, 170, 170))
+        self.sum_points = pg.PlotDataItem(pen=None, symbol="o", symbolSize=5, symbolPen=pg.mkPen("k"), symbolBrush="k")
+        self.sum_best = pg.PlotDataItem(pen=None, symbol="o", symbolSize=10, symbolPen=pg.mkPen("r"), symbolBrush="r")
+        self.sum_plot.addItem(self.sum_points)
+        self.sum_plot.addItem(self.sum_best)
+        return self.glw
 
     # ------------------------------------------------------------------ helpers
     def _log(self, text: str):
@@ -373,6 +488,7 @@ class PlaneAccuracyWindow(QWidget):
         QMessageBox.warning(self, "Error", msg)
 
     def _jog_stage(self, sx: int, sy: int):
+        self._clear_sum()       # another spot on the surface
         self._set_busy(True)
         s = self.stage_step.value()
         self._req_stage.emit(sx * s, sy * s)
@@ -391,7 +507,96 @@ class PlaneAccuracyWindow(QWidget):
         return HomodyneFinderParams(speed_um_s=self.speed.value(), n_sigma=self.n_sigma.value(), stop_after_um=stop,
                                     max_distance_um=max(2.0 * half, half + stop + 50.0))
 
+    def _snap(self):
+        if not self._snap_pending:
+            self._snap_pending = True
+            self._req_snap.emit(self.exposure.value(), self.gain.value(), False)
+
+    def _toggle_live(self, on: bool):
+        if on and not self._snap_pending:
+            self._snap_pending = True
+            self._req_snap.emit(self.exposure.value(), self.gain.value(), True)
+
+    def _on_frame(self, frame, z: float, live: bool):
+        if live or not self._running:
+            self._snap_pending = False
+        if frame is None:
+            self.live_btn.setChecked(False)
+            return
+        if self._running and self._sum_z and z < self._sum_z[-1]:
+            self._clear_sum()       # a new axial scan started
+        total = self._display_frame(frame, z)
+        self._add_sum(z, total)
+        if live and self.live_btn.isChecked() and not self._running:
+            self._snap_pending = True
+            self._req_snap.emit(self.exposure.value(), self.gain.value(), True)
+
+    def _display_frame(self, frame: np.ndarray, z: float) -> float:
+        """Min-max per frame, as in the human interface. Returns the summed intensity."""
+        frame = np.ascontiguousarray(frame).astype(np.float32, copy=False)
+        fmin, fmax = float(np.nanmin(frame)), float(np.nanmax(frame))
+        if not np.isfinite(fmin) or not np.isfinite(fmax) or fmax <= fmin:
+            fmin, fmax = 0.0, 1.0
+        self.img_item.setImage(frame, autoLevels=False, levels=(fmin, fmax))
+        px, sline = self._fitter.get_px_sline_from_image(frame)
+        self.spec_points.setData(px, sline)
+        total = self._fitter.get_total_sline_value(sline)
+        flag = "   NEAR SATURATION" if fmax >= SATURATION_COUNTS else ""
+        self.spec_plot.setTitle(f"Spectrum at lens z = {z:.1f} um, frame max {fmax:.0f} counts{flag}",
+                                color=(192, 57, 43) if flag else (40, 40, 40))
+        self._current_sum = (z, total)
+        self._update_sum_label()
+        return total
+
+    def _add_sum(self, z: float, total: float):
+        self._sum_z.append(z)
+        self._sum_v.append(total)
+        del self._sum_z[:-MAX_SUM_POINTS], self._sum_v[:-MAX_SUM_POINTS]
+        self._update_sum_plot()
+
+    def _update_sum_plot(self):
+        self.sum_points.setData(self._sum_z, self._sum_v)
+        if self._sum_v:
+            i = int(np.argmax(self._sum_v))
+            self.sum_best.setData([self._sum_z[i]], [self._sum_v[i]])
+        else:
+            self.sum_best.setData([], [])
+        self._update_sum_label()
+
+    def _update_sum_label(self):
+        z, total = self._current_sum if self._current_sum is not None else (None, None)
+        text = "Summed intensity: —" if z is None else f"Summed intensity {total:.0f} at z = {z:.1f} um"
+        if self._sum_v:
+            i = int(np.argmax(self._sum_v))
+            text += f"     brightest {self._sum_v[i]:.0f} at z = {self._sum_z[i]:.1f} um"
+        self.sum_label.setText(text)
+
+    def _clear_sum(self):
+        self._sum_z, self._sum_v = [], []
+        self._fitter = SpectrumFitter()     # its automatic row band may have frozen on a dark frame
+        self._update_sum_plot()
+
+    def _scan_here(self):
+        self.live_btn.setChecked(False)
+        self._clear_sum()
+        self._set_busy(True)
+        self._req_scan.emit(self.exposure.value(), self.gain.value(), self.ax_before.value(), self.ax_after.value(),
+                            self.ax_step.value())
+
+    def _move_to_brightest(self):
+        if self._sum_v:
+            self._set_busy(True)
+            self._req_lens_to.emit(self._sum_z[int(np.argmax(self._sum_v))])
+
+    def _show_axial_frame(self, i: int):
+        rec = self._last_axial
+        if rec is None or not 0 <= i < rec.frames.shape[0]:
+            return
+        self.frame_slider_label.setText(f"Last axial scan, frame {i + 1}/{rec.frames.shape[0]}, z = {rec.z_um[i]:.1f} um")
+        self._display_frame(rec.frames[i], float(rec.z_um[i]))
+
     def _find(self, direction: float):
+        self.live_btn.setChecked(False)
         self._set_busy(True)
         self._req_find.emit(direction, self._find_params(), self.half.value())
 
@@ -463,6 +668,7 @@ class PlaneAccuracyWindow(QWidget):
         if r != QMessageBox.Yes:
             return
         self._err = {k: ([], []) for k in self._err}
+        self.live_btn.setChecked(False)
         self._running = True
         self._set_busy(True)
         self._req_run.emit(cfg, run_dir)
@@ -505,12 +711,13 @@ class PlaneAccuracyWindow(QWidget):
         a.set(xlabel="lens z (um)", ylabel="S", title=f"Last find: {rec.meta.get('kind')}")
 
     def _plot_axial(self, row, rec):
-        a = self.ax_axial
-        a.clear()
-        s = rec.frame_sums()
-        a.plot(rec.z_um, s, "o-", ms=3, lw=0.8, color="#1f1f1e")
-        a.axvline(row["lens_pred_um"], color="#8a8a85", lw=0.8, ls=":")
-        a.set(xlabel="lens z (um)", ylabel="frame sum (counts)", title=f"Last axial scan, R = {row['r_mm']:.2f} mm")
+        self._last_axial = rec
+        self.frame_slider.setEnabled(True)
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setRange(0, rec.frames.shape[0] - 1)
+        self.frame_slider.setValue(int(np.argmax(self._sum_v)) if len(self._sum_v) == rec.frames.shape[0] else 0)
+        self.frame_slider.blockSignals(False)
+        self._show_axial_frame(self.frame_slider.value())
 
     def _plot_errors(self):
         a = self.ax_err
@@ -529,6 +736,7 @@ class PlaneAccuracyWindow(QWidget):
             QMessageBox.information(self, "Busy", "Stop the run first.")
             event.ignore()
             return
+        self.live_btn.setChecked(False)
         self._req_shutdown.emit()
         self._thread.quit()
         self._thread.wait(5000)

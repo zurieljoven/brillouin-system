@@ -149,9 +149,10 @@ def run_find(dev: Devices, p: HomodyneFinderParams, z_pred: float, half_um: floa
     return recording_from_find(r, dev.daq, p=p, z0=z_pred, z_start=z_start, direction=direction, meta=meta)
 
 
-def run_axial(dev: Devices, cfg: RunConfig, z_pred: float, meta: dict, stop: threading.Event,
-              on_frame: Optional[Callable[[np.ndarray], None]] = None) -> AxialRecording:
-    targets = axial_positions_um(z_pred, cfg.axial_before_um, cfg.axial_after_um, cfg.axial_step_um)
+def run_axial(dev: Devices, before_um: float, after_um: float, step_um: float, z_pred: float, meta: dict,
+              stop: threading.Event,
+              on_frame: Optional[Callable[[np.ndarray, float], None]] = None) -> AxialRecording:
+    targets = axial_positions_um(z_pred, before_um, after_um, step_um)
     dev.lens.move_abs(targets[0] - LENS_PRELOAD_UM)
     frames, zs, ts = [], [], []
     for z in targets:
@@ -164,12 +165,18 @@ def run_axial(dev: Devices, cfg: RunConfig, z_pred: float, meta: dict, stop: thr
         frame = np.asarray(dev.camera.snap())
         frames.append(frame)
         if on_frame is not None:
-            on_frame(frame)
+            on_frame(frame, zs[-1])
     meta = dict(meta, z_pred_um=z_pred, exposure_s=float(dev.camera.get_exposure_time()),
                 gain=float(dev.camera.get_emccd_gain()), roi=[int(v) for v in dev.camera.get_roi()],
                 binning=[int(v) for v in dev.camera.get_binning()],
-                before_um=cfg.axial_before_um, after_um=cfg.axial_after_um, step_um=cfg.axial_step_um)
+                before_um=before_um, after_um=after_um, step_um=step_um)
     return AxialRecording(frames=np.stack(frames), z_um=np.array(zs), t_perf=np.array(ts), meta=meta)
+
+
+def move_lens_from_below(lens, z_um: float) -> None:
+    """Approach from the side the axial scans step in, so the z of a frame can be returned to."""
+    lens.move_abs(z_um - LENS_PRELOAD_UM)
+    lens.move_abs(z_um)
 
 
 def open_sample_path(shutters) -> None:
@@ -186,6 +193,7 @@ def run_experiment(
     *,
     on_status: Callable[[str], None] = lambda s: None,
     on_trial: Callable[[dict, object], None] = lambda row, rec: None,
+    on_frame: Optional[Callable[[np.ndarray, float], None]] = None,
 ) -> dict:
     """Runs all trials. Returns counts. Device errors end the run and propagate; misses do not."""
     cfg.validate()
@@ -228,7 +236,8 @@ def run_experiment(
             name = f"{t.index + 1:03d}_b{t.block}_r{t.r_mm:.2f}_{t.kind}.h5"
             if t.kind == "axial":
                 try:
-                    rec = run_axial(dev, cfg, z_pred, meta, stop)
+                    rec = run_axial(dev, cfg.axial_before_um, cfg.axial_after_um, cfg.axial_step_um, z_pred, meta, stop,
+                                    on_frame)
                 except Cancelled:
                     break
                 save_axial(rec, run_dir / name)
