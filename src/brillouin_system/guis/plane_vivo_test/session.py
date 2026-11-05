@@ -1,0 +1,266 @@
+"""
+In vivo plane finder testing, without Qt. Every slew is saved raw as it finishes,
+misses and rejected crossings included, with the settings and the eye tracker
+reading, so failures can be replayed offline.
+
+A round trip: forward find from plane - approach, optional Andor frame at
+plane + depth, backward find from plane + approach. Nothing here gates the data;
+the gate only decides whether a crossing may update the plane estimate.
+"""
+
+from __future__ import annotations
+
+import csv
+import math
+import threading
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Optional
+
+import numpy as np
+
+from brillouin_system.guis.plane_accuracy_test.axial_recording import AxialRecording, save_axial
+from brillouin_system.guis.plane_accuracy_test.runner import Devices, open_sample_path, recording_from_find
+from brillouin_system.scan_managers.homodyne_plane_finder import (
+    PRE_ROLL_S, HomodyneFinderParams, find_reflection_homodyne, zero_phase_s,
+)
+from brillouin_system.scan_managers.homodyne_recording import HomodyneRecording, save_recording
+
+LENS_SETTLE_S = 0.05
+SHUTTER_SETTLE_S = 0.1
+MAX_XY_MOVE_UM = 3500.0     # as Move XY in the human interface
+
+LOG_FIELDS = ["n", "time", "t_perf", "label", "run", "cycle", "direction", "status", "z_um", "plane_before_um", "start_um",
+              "search_um", "truncated", "s_peak", "threshold", "background_mean", "background_std", "peak_snr",
+              "z_at_max_um", "lo_v", "stage_x_um", "stage_y_um", "target_r_mm", "target_phi_deg", "eye_x_mm", "eye_y_mm",
+              "eye_dc_mm", "eye_age_s", "file"]
+
+
+@dataclass(frozen=True)
+class Settings:
+    ceiling_um: float
+    retract_um: float
+    speed_um_s: float = 400.0
+    n_sigma: float = 20.0
+    stop_after_um: float = 150.0
+    search_um: float = 1500.0       # single finds from the current z
+    approach_um: float = 300.0
+    gate_um: float = 200.0          # a crossing further than this from the estimate does not update it
+    n_cycles: int = 10
+    max_misses: int = 3             # consecutive missed forward finds end the round trips
+    frame_depth_um: float = 0.0     # 0 = no Andor frames
+    exposure_s: float = 0.2
+    gain: int = 0
+    target_r_mm: Optional[float] = None
+    target_phi_deg: Optional[float] = None
+
+    def validate(self) -> None:
+        if self.retract_um >= self.ceiling_um:
+            raise ValueError("The retract position must be below the lens limit.")
+        p = HomodyneFinderParams()
+        travel_bg = (p.bg_start_s + p.bg_duration_s) * self.speed_um_s
+        if self.approach_um < travel_bg + 50.0:
+            raise ValueError(f"Approach must be at least {travel_bg + 50.0:.0f} um at this speed: "
+                             f"the finder measures its background over the first {travel_bg:.0f} um.")
+        if self.gate_um <= 0 or self.n_cycles < 1 or self.max_misses < 1:
+            raise ValueError("Gate, round trips and misses must be positive.")
+
+    def params(self, search_um: float) -> HomodyneFinderParams:
+        return HomodyneFinderParams(speed_um_s=self.speed_um_s, n_sigma=self.n_sigma, stop_after_um=self.stop_after_um,
+                                    max_distance_um=search_um)
+
+
+@dataclass
+class Slew:
+    status: str     # "found" | "rejected" | "missed" | "stopped" (cut short by STOP) | "no data"
+    z_um: Optional[float]
+    row: dict
+    rec: Optional[HomodyneRecording]
+
+
+def xy_move_for_target(r_mm: float, phi_deg: float, laser_xy_mm: tuple[float, float]) -> tuple[float, float, bool]:
+    """Stage move [um] that puts the laser at (R, phi) in pupil coordinates; same signs and limit as
+    Move XY in the human interface. Returns dx, dy, clamped."""
+    dx = (r_mm * math.cos(math.radians(phi_deg)) - laser_xy_mm[0]) * 1000.0
+    dy = (r_mm * math.sin(math.radians(phi_deg)) - laser_xy_mm[1]) * 1000.0
+    size = math.hypot(dx, dy)
+    scale = min(1.0, MAX_XY_MOVE_UM / size) if size > 0 else 1.0
+    return -dx * scale, dy * scale, scale < 1.0
+
+
+def peak_diagnostics(rec: HomodyneRecording, params: HomodyneFinderParams) -> tuple[Optional[float], Optional[float]]:
+    """Peak SNR after the background window and its z, also for a miss: how close was it?"""
+    z = rec.z_um()
+    fs = rec.sample_rate_hz
+    i0 = int(round((PRE_ROLL_S + params.bg_start_s + params.bg_duration_s) * fs))
+    mean, std = rec.meta.get("finder_background_mean"), rec.meta.get("finder_background_std")
+    if z is None or mean is None or not std or rec.n_samples <= i0 + 2:
+        return None, None
+    s = zero_phase_s(rec.values, fs, params)
+    i = i0 + int(np.argmax(s[i0:]))
+    return float((s[i] - mean) / std), float(z[i])
+
+
+class Session:
+    def __init__(self, dev: Devices, run_dir: Path, subject: str = "",
+                 eye_state: Callable[[], dict] = dict,
+                 on_status: Callable[[str], None] = lambda s: None,
+                 on_slew: Callable[[Slew], None] = lambda s: None,
+                 on_frame: Callable[[np.ndarray, float], None] = lambda f, z: None):
+        self.dev, self.run_dir, self.subject = dev, Path(run_dir), subject
+        self.eye_state, self.on_status, self.on_slew, self.on_frame = eye_state, on_status, on_slew, on_frame
+        self.n = 0
+        self.run = 0
+        self.plane_um: Optional[float] = None
+
+    def _next_name(self, kind: str) -> str:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.n += 1
+        return f"{self.n:04d}_{kind}.h5"
+
+    def _log(self, row: dict) -> None:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        path = self.run_dir / "slews.csv"
+        new = not path.exists()
+        with open(path, "a", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=LOG_FIELDS, extrasaction="ignore")
+            if new:
+                w.writeheader()
+            w.writerow(row)
+
+    def _base_meta(self, st: Settings) -> dict:
+        sx, sy, _ = self.dev.stage.get_position()
+        eye = self.eye_state() or {}
+        return dict(experiment=self.run_dir.name, subject=self.subject, settings=asdict(st), stage_x_um=sx, stage_y_um=sy,
+                    target_r_mm=st.target_r_mm, target_phi_deg=st.target_phi_deg, **eye)
+
+    def find(self, st: Settings, direction: float, start_um: Optional[float], search_um: float, stop: threading.Event,
+             *, label: str = "single", cycle: Optional[int] = None, gated: bool = True) -> Slew:
+        """start_um None: from the current z. Leaves the lens wherever the find ended. gated False: any
+        crossing updates the estimate."""
+        lens = self.dev.lens
+        if start_um is not None:
+            lens.move_abs(start_um)
+            time.sleep(LENS_SETTLE_S)
+        z_start = float(lens.get_position())
+        room = lens.room_um(direction, search_um)
+        if room < st.stop_after_um:
+            raise ValueError(f"Only {room:.0f} um of room before the lens limit, from z = {z_start:.1f} um.")
+        p = st.params(room)
+        plane_before = self.plane_um
+        meta = dict(self._base_meta(st), label=label, run=self.run, cycle=cycle, plane_before_um=plane_before,
+                    kind="find_fwd" if direction > 0 else "find_bwd", truncated=room < search_um)
+        r = find_reflection_homodyne(self.dev.daq, lens, p, direction=direction, stop_evt=stop)
+        rec = None
+        if r.daq_values is not None:
+            rec = recording_from_find(r, self.dev.daq, p=p, z0=z_start, z_start=z_start, direction=direction, meta=meta)
+            rec.meta["stopped_early"] = stop.is_set()
+
+        status = "no data" if rec is None else "stopped" if stop.is_set() else "missed"
+        z = None
+        if r.found:
+            z = float(r.event_z_um)
+            accepted = not gated or plane_before is None or abs(z - plane_before) <= st.gate_um
+            status = "found" if accepted else "rejected"
+            if accepted:
+                self.plane_um = z
+        name = None
+        snr, z_max, lo = None, None, None
+        if rec is not None:
+            rec.meta["status"] = status
+            name = self._next_name(rec.meta["kind"])
+            save_recording(rec, self.run_dir / name)
+            snr, z_max = peak_diagnostics(rec, p)
+            lo = float(np.mean(rec.values))
+        row = dict(rec.meta if rec is not None else meta, n=self.n, t_perf=time.perf_counter(),
+                   time=datetime.now().isoformat(timespec="milliseconds"), direction=direction, status=status, z_um=z,
+                   start_um=z_start, search_um=room, s_peak=r.peak_value, threshold=r.threshold_high,
+                   background_mean=r.background_mean, background_std=r.background_std, peak_snr=snr, z_at_max_um=z_max,
+                   lo_v=lo, file=name)
+        self._log(row)
+        slew = Slew(status, z, row, rec)
+        self.on_slew(slew)
+        return slew
+
+    def _frame(self, st: Settings, z_um: float, cycle: int) -> None:
+        lens, cam = self.dev.lens, self.dev.camera
+        lens.move_abs(z_um)
+        time.sleep(LENS_SETTLE_S)
+        z = float(lens.get_position())
+        t = time.perf_counter()
+        frame = np.asarray(cam.snap())
+        meta = dict(self._base_meta(st), kind="frame", cycle=cycle, plane_um=self.plane_um,
+                    depth_um=st.frame_depth_um, exposure_s=float(cam.get_exposure_time()),
+                    gain=float(cam.get_emccd_gain()))
+        save_axial(AxialRecording(frames=frame[None], z_um=np.array([z]), t_perf=np.array([t]), meta=meta),
+                   self.run_dir / self._next_name("frame"))
+        self.on_frame(frame, z)
+
+    def round_trips(self, st: Settings, stop: threading.Event) -> dict:
+        """Needs a plane estimate. Always retracts and closes the shutters at the end, also on an error."""
+        st.validate()
+        if self.plane_um is None:
+            raise ValueError("No plane estimate yet: run a single find first.")
+        self.run += 1
+        counts = dict(cycles=0, found=0, rejected=0, missed=0, ended="done")
+        if st.frame_depth_um > 0:
+            self.dev.camera.set_exposure_time(st.exposure_s)
+            self.dev.camera.set_emccd_gain(st.gain)
+        self.open_shutters()
+        misses = 0
+        try:
+            for k in range(st.n_cycles):
+                if stop.is_set():
+                    counts["ended"] = "stopped"
+                    break
+                self.on_status(f"Round trip {k + 1}/{st.n_cycles}, plane estimate {self.plane_um:.1f} um")
+                s_in = self.find(st, 1.0, self.plane_um - st.approach_um, 2.0 * st.approach_um, stop,
+                                 label="round_trip", cycle=k)
+                if s_in.status in counts:
+                    counts[s_in.status] += 1
+                counts["cycles"] += 1
+                misses = misses + 1 if s_in.status in ("missed", "no data", "rejected") else 0
+                if misses >= st.max_misses:
+                    counts["ended"] = f"{misses} forward finds in a row without a plane"
+                    break
+                if stop.is_set():
+                    counts["ended"] = "stopped"
+                    break
+                if s_in.status == "found" and st.frame_depth_um > 0:
+                    self._frame(st, self.plane_um + st.frame_depth_um, k)
+                s_out = self.find(st, -1.0, self.plane_um + st.approach_um, 2.0 * st.approach_um, stop,
+                                  label="round_trip", cycle=k)
+                if s_out.status in counts:
+                    counts[s_out.status] += 1
+        finally:
+            self.retract(st)
+        return counts
+
+    def single_find(self, st: Settings, direction: float, stop: threading.Event) -> Slew:
+        """From the current z, then back to where it started."""
+        z0 = float(self.dev.lens.get_position())
+        self.open_shutters()
+        try:
+            return self.find(st, direction, None, st.search_um, stop, gated=False)
+        finally:
+            try:
+                self.dev.lens.move_abs(z0)
+            finally:
+                self.close_shutters()
+
+    def retract(self, st: Settings) -> None:
+        try:
+            self.dev.lens.move_abs(st.retract_um)
+        finally:
+            self.close_shutters()
+
+    def open_shutters(self) -> None:
+        if self.dev.shutters is not None:
+            open_sample_path(self.dev.shutters)
+            time.sleep(SHUTTER_SETTLE_S)
+
+    def close_shutters(self) -> None:
+        if self.dev.shutters is not None:
+            self.dev.shutters.close_all()
