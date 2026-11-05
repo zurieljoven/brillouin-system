@@ -1,4 +1,5 @@
 import csv
+import math
 import threading
 
 import pytest
@@ -9,7 +10,7 @@ from brillouin_system.guis.plane_accuracy_test.axial_recording import load_axial
 from brillouin_system.guis.plane_accuracy_test.runner import Devices
 from brillouin_system.guis.plane_accuracy_test.sim_camera import SimAndor
 from brillouin_system.guis.plane_vivo_test.bounded_lens import BoundedLens, LensLimitError
-from brillouin_system.guis.plane_vivo_test.session import Session, Settings, xy_move_for_target
+from brillouin_system.guis.plane_vivo_test.session import Session, Settings, parse_locations, xy_move_for_target
 from brillouin_system.patient_movement_analysis.simulated_devices import SimZaberLens
 from brillouin_system.scan_managers.homodyne_recording import load_recording
 
@@ -48,7 +49,8 @@ def rig(peak=0.2, lens_start=PLANE - 500.0, ceiling=PLANE + 1000.0):
 
 
 def settings(**kw):
-    return Settings(**{**dict(ceiling_um=PLANE + 1000.0, retract_um=PLANE - 500.0, n_cycles=2, exposure_s=0.0), **kw})
+    return Settings(**{**dict(ceiling_um=PLANE + 1000.0, retract_um=PLANE - 500.0, n_cycles=2, exposure_s=0.0,
+                              settle_s=0.0), **kw})
 
 
 def rows(run):
@@ -148,6 +150,234 @@ def test_far_crossing_is_saved_as_rejected_and_keeps_the_estimate(tmp_path):
     st = settings(gate_um=50.0, approach_um=500.0)
     slew = s.find(st, 1.0, PLANE - 100.0, 400.0, threading.Event())
     assert slew.status == "rejected" and s.plane_um == PLANE + 400.0
+
+
+def test_auto_test_searches_from_the_retract_position_then_runs_round_trips(tmp_path):
+    dev = rig(lens_start=PLANE - 200.0)
+    s = Session(dev, tmp_path / "run")
+    s.plane_um = PLANE + 700.0      # stale: the search must replace it
+    c = s.auto_test(settings(), threading.Event())
+    r = rows(tmp_path / "run")
+    assert r[0]["label"] == "search" and float(r[0]["start_um"]) == pytest.approx(PLANE - 500.0, abs=2.0)
+    assert c["ended"] == "done" and c["cycles"] == 2 and c["found"] == 4
+    assert dev.lens.get_position() == pytest.approx(PLANE - 500.0, abs=2.0)
+
+
+def test_auto_test_without_a_plane_retracts_and_runs_nothing_more(tmp_path):
+    dev = rig(peak=0.0)
+    s = Session(dev, tmp_path / "run")
+    c = s.auto_test(settings(search_um=800.0), threading.Event())
+    assert c["ended"] == "no plane found" and c["cycles"] == 0
+    assert len(rows(tmp_path / "run")) == 1
+    assert dev.lens.get_position() == pytest.approx(PLANE - 500.0, abs=2.0)
+
+
+def test_auto_test_counts_down_with_shutters_closed_then_reports_by_sound(tmp_path):
+    class Shutters:
+        def __init__(self):
+            self.log = []
+            self.sample = self
+
+        def change_to_objective(self):
+            self.log.append("objective")
+
+        def open(self):
+            self.log.append("open")
+
+        def close_all(self):
+            self.log.append("closed")
+
+    dev = rig()
+    dev.shutters = Shutters()
+    heard = []
+    s = Session(dev, tmp_path / "run", cue=lambda n: (heard.append(n), dev.shutters.log.append(n)))
+    said = []
+    s.say = said.append
+    s.auto_test(settings(settle_s=2.0, n_cycles=1), threading.Event())
+    assert heard == ["count", "count", "go", "success"]
+    assert said == ["2 of 2 found"]
+    assert dev.shutters.log[:4] == ["count", "count", "go", "objective"]
+    assert dev.shutters.log[-2:] == ["closed", "success"]
+
+
+def test_stop_during_the_countdown_opens_nothing(tmp_path):
+    dev = rig()
+    stop = threading.Event()
+    heard = []
+    s = Session(dev, tmp_path / "run", cue=lambda n: (heard.append(n), stop.set()))
+    c = s.auto_test(settings(settle_s=5.0), stop)
+    assert c["ended"] == "stopped" and heard == ["count", "stopped"]
+    assert not (tmp_path / "run" / "slews.csv").exists()
+
+
+def test_failed_search_sounds_as_a_failure(tmp_path):
+    heard = []
+    Session(rig(peak=0.0), tmp_path / "a", cue=heard.append).auto_test(settings(search_um=800.0), threading.Event())
+    assert heard == ["go", "miss", "failed"]
+
+
+def test_spoken_result_names_the_failure(tmp_path):
+    said = []
+    Session(rig(peak=0.0), tmp_path / "a", say=said.append).auto_test(settings(search_um=800.0), threading.Event())
+    assert said == ["no plane found"]
+    said.clear()
+    s = Session(rig(), tmp_path / "b", say=said.append)
+    s.auto_test(settings(n_cycles=3), threading.Event())
+    assert said[0].startswith("6 of 6 found, short term sigma ") and said[0].endswith(" microns")
+
+
+def test_speech_commands_quote_safely():
+    from brillouin_system.guis.plane_vivo_test import cues
+    original = cues.sys.platform
+    try:
+        cues.sys.platform = "win32"
+        cmd = cues.speech_command("it's 6 of 6; found")
+    finally:
+        cues.sys.platform = original
+    assert cmd[0] == "powershell" and "'its 6 of 6 found'" in cmd[-1]
+
+
+class EyeOnStage:
+    """Pupil reading that responds to the stage with the human interface's signs: stage +x moves the reading -x
+    (dx_stage = -dx_laser), stage +y moves it +y. wrong=True flips the response."""
+
+    def __init__(self, dev, x, y, wrong=False, plane=PLANE):
+        self.dev, self.x, self.y, self.sign, self.plane = dev, x, y, -1.0 if wrong else 1.0, plane
+        self.x0, self.y0, _ = dev.stage.get_position()
+
+    def __call__(self):
+        sx, sy, _ = self.dev.stage.get_position()
+        return dict(eye_x_mm=self.x - self.sign * (sx - self.x0) / 1000.0,
+                    eye_y_mm=self.y + self.sign * (sy - self.y0) / 1000.0, eye_age_s=0.0,
+                    eye_plane_um=self.plane)
+
+
+def test_centering_reaches_the_target_after_the_countdown(tmp_path):
+    dev = rig()
+    eye = EyeOnStage(dev, -0.5, 0.4)
+    heard = []
+    s = Session(dev, tmp_path / "a", eye_state=eye, cue=heard.append)
+    c = s.auto_test(settings(center_first=True, target_r_mm=0.0, n_cycles=1, settle_s=1.0), threading.Event())
+    assert c["ended"] == "done" and heard[:2] == ["count", "go"]
+    now = eye()
+    assert abs(now["eye_x_mm"]) < 0.01 and abs(now["eye_y_mm"]) < 0.01
+
+
+@pytest.mark.parametrize("name, state, why", [
+    ("far", dict(eye_x_mm=5.0, eye_y_mm=0.0, eye_age_s=0.0), "too far"),
+    ("none", dict(eye_x_mm=None, eye_y_mm=None, eye_age_s=0.0), "no pupil found"),
+    ("old", dict(eye_x_mm=0.1, eye_y_mm=0.0, eye_age_s=99.0), "no pupil found"),
+])
+def test_centering_refuses_a_bad_reading_without_moving_or_opening(tmp_path, name, state, why):
+    dev = rig()
+    before = dev.stage.get_position()
+    said = []
+    s = Session(dev, tmp_path / name, eye_state=lambda: state, say=said.append)
+    c = s.auto_test(settings(center_first=True, target_r_mm=0.0), threading.Event())
+    assert c["cycles"] == 0 and why in said[0] and dev.stage.get_position() == before
+    assert not (tmp_path / name / "slews.csv").exists()
+
+
+def test_centering_gives_up_if_the_stage_moves_it_the_wrong_way(tmp_path):
+    dev = rig()
+    x0 = dev.stage.get_position()[0]
+    said = []
+    s = Session(dev, tmp_path / "a", eye_state=EyeOnStage(dev, 0.5, 0.0, wrong=True), say=said.append)
+    c = s.auto_test(settings(center_first=True, target_r_mm=0.0), threading.Event())
+    assert c["cycles"] == 0 and said == ["centering is not converging"]
+    assert abs(dev.stage.get_position()[0] - x0) <= 501.0   # one move, not a runaway
+    assert not (tmp_path / "a" / "slews.csv").exists()
+
+
+def locations_csv(run):
+    with open(run / "locations.csv", newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_parse_locations():
+    assert parse_locations("0,0; 1,90;2,-45 ;") == ((0.0, 0.0), (1.0, 90.0), (2.0, -45.0))
+    for bad in ("", "1", "1,2,3", "a,b", "9,0"):
+        with pytest.raises(ValueError):
+            parse_locations(bad)
+
+
+def test_one_click_runs_every_location_in_random_order_and_saves_the_depth_estimate(tmp_path):
+    dev = rig()
+    eye = EyeOnStage(dev, 0.3, -0.2, plane=PLANE + 40.0)
+    said = []
+    s = Session(dev, tmp_path / "a", eye_state=eye, say=said.append)
+    locs = ((0.0, 0.0), (1.0, 0.0), (1.0, 90.0), (1.0, 180.0))
+    c = s.auto_test(settings(center_first=True, locations=locs, n_cycles=1), threading.Event())
+    assert c["ended"] == "done" and c["found"] == 8 and c["n_failed"] == 0
+    r = locations_csv(tmp_path / "a")
+    assert {(float(x["r_mm"]), float(x["phi_deg"])) for x in r} == set(locs)
+    assert all(float(x["z_tracker_um"]) == PLANE + 40.0 and abs(float(x["z_search_um"]) - PLANE) < 15 for x in r)
+    last = eye()
+    target = (float(r[-1]["r_mm"]) * math.cos(math.radians(float(r[-1]["phi_deg"]))),
+              float(r[-1]["r_mm"]) * math.sin(math.radians(float(r[-1]["phi_deg"]))))
+    assert math.dist((last["eye_x_mm"], last["eye_y_mm"]), target) < 0.21
+    assert said == ["8 of 8 found"]
+    assert dev.lens.get_position() == pytest.approx(PLANE - 500.0, abs=2.0)
+
+
+def test_an_outer_location_can_come_first(tmp_path):
+    dev = rig()
+    s = Session(dev, tmp_path / "a", eye_state=EyeOnStage(dev, 0.5, 0.0))
+    c = s.auto_test(settings(center_first=True, locations=((2.5, 180.0),), n_cycles=1), threading.Event())
+    assert c["ended"] == "done" and c["n_failed"] == 0
+
+
+def test_a_badly_placed_head_is_still_refused_at_the_first_location(tmp_path):
+    dev = rig()
+    before = dev.stage.get_position()
+    s = Session(dev, tmp_path / "a", eye_state=EyeOnStage(dev, 2.0, 0.0))
+    c = s.auto_test(settings(center_first=True, target_r_mm=0.0), threading.Event())
+    assert "too far" in c["ended"] and dev.stage.get_position() == before
+
+
+def test_search_starts_in_front_of_the_tracker_plane(tmp_path):
+    dev = rig()
+    s = Session(dev, tmp_path / "a", eye_state=EyeOnStage(dev, 0.0, 0.0, plane=PLANE + 20.0))
+    s.auto_test(settings(center_first=True, target_r_mm=0.0, z_margin_um=300.0, n_cycles=1), threading.Event())
+    first = rows(tmp_path / "a")[0]
+    assert first["label"] == "search" and float(first["start_um"]) == pytest.approx(PLANE - 280.0, abs=3.0)
+
+
+def test_tracker_past_the_cornea_costs_a_second_search_from_the_retract_position(tmp_path):
+    dev = rig()
+    s = Session(dev, tmp_path / "a", eye_state=EyeOnStage(dev, 0.0, 0.0, plane=PLANE + 600.0))
+    c = s.auto_test(settings(center_first=True, target_r_mm=0.0, z_margin_um=300.0, search_um=300.0, n_cycles=1),
+                    threading.Event())
+    r = rows(tmp_path / "a")
+    assert [x["label"] for x in r[:2]] == ["search", "search_fallback"] and r[0]["status"] == "missed"
+    assert locations_csv(tmp_path / "a")[0]["fell_back"] == "True"
+    assert c["ended"] == "no plane found"       # 300 um of search from 500 um out cannot reach it
+
+
+def test_unbelievable_depth_is_ignored_and_never_passes_the_limit(tmp_path):
+    dev = rig()
+    s = Session(dev, tmp_path / "a", eye_state=EyeOnStage(dev, 0.0, 0.0, plane=PLANE + 5000.0))
+    c = s.auto_test(settings(center_first=True, target_r_mm=0.0, n_cycles=1), threading.Event())
+    assert float(rows(tmp_path / "a")[0]["start_um"]) == pytest.approx(PLANE - 500.0, abs=3.0) and c["found"] == 2
+
+
+def test_a_failed_location_is_skipped_and_two_without_a_pupil_end_the_run(tmp_path):
+    dev = rig(peak=0.0)
+    said = []
+    s = Session(dev, tmp_path / "a", eye_state=EyeOnStage(dev, 0.0, 0.0), say=said.append)
+    locs = ((0.0, 0.0), (0.1, 0.0))
+    c = s.auto_test(settings(center_first=True, locations=locs, search_um=800.0), threading.Event())
+    assert c["n_failed"] == 2 and len(locations_csv(tmp_path / "a")) == 2 and "no plane" in said[0]
+    dev = rig()
+    s = Session(dev, tmp_path / "b", eye_state=lambda: dict(eye_x_mm=None, eye_y_mm=None, eye_age_s=0.0))
+    locs = ((0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (1.0, 90.0))
+    c = s.auto_test(settings(center_first=True, locations=locs), threading.Event())
+    assert c["ended"] == "no pupil found" and len(locations_csv(tmp_path / "b")) == 2
+
+
+def test_every_cue_exists():
+    from brillouin_system.guis.plane_vivo_test.cues import PATTERNS
+    assert {"count", "go", "miss", "success", "partial", "failed", "stopped"} <= set(PATTERNS)
 
 
 def test_single_find_at_a_new_spot_is_not_gated(tmp_path):

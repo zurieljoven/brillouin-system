@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import csv
 import math
+import random
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -31,11 +32,24 @@ from brillouin_system.scan_managers.homodyne_recording import HomodyneRecording,
 LENS_SETTLE_S = 0.05
 SHUTTER_SETTLE_S = 0.1
 MAX_XY_MOVE_UM = 3500.0     # as Move XY in the human interface
+MAX_AUTO_XY_MOVE_UM = 1500.0    # automatic centering, nobody watching: a bad pupil fit must not move far
+MAX_EYE_AGE_S = 0.5
+EYE_WAIT_S = 2.0            # rides out a blink
+Z_READ_S = 0.4
+MAX_AUTO_Z_MOVE_UM = 2000.0     # as Move Z in the human interface; further forward than this is not believed
+MAX_NO_PUPIL = 2            # locations in a row: the subject has moved away, stop
+NO_PUPIL = "no pupil found"
+NO_PLANE = "no plane found"
+CENTER_MOVES = 3
+CENTER_TOL_MM = 0.2
+STAGE_SETTLE_S = 0.2
 
 LOG_FIELDS = ["n", "time", "t_perf", "label", "run", "cycle", "direction", "status", "z_um", "plane_before_um", "start_um",
               "search_um", "truncated", "s_peak", "threshold", "background_mean", "background_std", "peak_snr",
               "z_at_max_um", "lo_v", "stage_x_um", "stage_y_um", "target_r_mm", "target_phi_deg", "eye_x_mm", "eye_y_mm",
-              "eye_dc_mm", "eye_age_s", "file"]
+              "eye_dc_mm", "eye_plane_um", "eye_lens_um", "eye_age_s", "test", "location", "z_tracker_um", "seed", "file"]
+LOCATION_FIELDS = ["test", "order", "seed", "r_mm", "phi_deg", "ended", "centered", "z_tracker_um", "z_start_um",
+                   "fell_back", "z_search_um", "cycles", "found", "rejected", "missed", "sigma_um"]
 
 
 @dataclass(frozen=True)
@@ -55,6 +69,10 @@ class Settings:
     gain: int = 0
     target_r_mm: Optional[float] = None
     target_phi_deg: Optional[float] = None
+    settle_s: float = 3.0           # countdown after the click, to settle and fixate
+    center_first: bool = False      # XYZ from the eye tracker at every location, after the countdown
+    z_margin_um: float = 1000.0     # the search starts this far in front of the tracker's plane
+    locations: tuple = ()           # (R mm, phi deg) of a click, in random order; empty: the target above
 
     def validate(self) -> None:
         if self.retract_um >= self.ceiling_um:
@@ -66,6 +84,8 @@ class Settings:
                              f"the finder measures its background over the first {travel_bg:.0f} um.")
         if self.gate_um <= 0 or self.n_cycles < 1 or self.max_misses < 1:
             raise ValueError("Gate, round trips and misses must be positive.")
+        if len(self.locations) > 1 and not self.center_first:
+            raise ValueError("Several locations need the eye tracker centering.")
 
     def params(self, search_um: float) -> HomodyneFinderParams:
         return HomodyneFinderParams(speed_um_s=self.speed_um_s, n_sigma=self.n_sigma, stop_after_um=self.stop_after_um,
@@ -80,13 +100,35 @@ class Slew:
     rec: Optional[HomodyneRecording]
 
 
-def xy_move_for_target(r_mm: float, phi_deg: float, laser_xy_mm: tuple[float, float]) -> tuple[float, float, bool]:
+def parse_locations(text: str) -> tuple:
+    """ "0,0; 1,90; 2,180" -> ((0.0, 0.0), (1.0, 90.0), (2.0, 180.0)) """
+    out = []
+    for part in text.split(";"):
+        if part.strip():
+            try:
+                r, phi = (float(v) for v in part.split(","))
+            except ValueError:
+                raise ValueError(f"Locations are written R,phi; R,phi. Cannot read '{part.strip()}'.") from None
+            if not 0.0 <= r <= 5.0:
+                raise ValueError(f"Location R must be 0 to 5 mm, got {r:g}.")
+            out.append((r, phi))
+    if not out:
+        raise ValueError("No locations given.")
+    return tuple(out)
+
+
+def _target_xy(r_mm: float, phi_deg: float) -> tuple[float, float]:
+    return r_mm * math.cos(math.radians(phi_deg)), r_mm * math.sin(math.radians(phi_deg))
+
+
+def xy_move_for_target(r_mm: float, phi_deg: float, laser_xy_mm: tuple[float, float],
+                       max_um: float = MAX_XY_MOVE_UM) -> tuple[float, float, bool]:
     """Stage move [um] that puts the laser at (R, phi) in pupil coordinates; same signs and limit as
     Move XY in the human interface. Returns dx, dy, clamped."""
     dx = (r_mm * math.cos(math.radians(phi_deg)) - laser_xy_mm[0]) * 1000.0
     dy = (r_mm * math.sin(math.radians(phi_deg)) - laser_xy_mm[1]) * 1000.0
     size = math.hypot(dx, dy)
-    scale = min(1.0, MAX_XY_MOVE_UM / size) if size > 0 else 1.0
+    scale = min(1.0, max_um / size) if size > 0 else 1.0
     return -dx * scale, dy * scale, scale < 1.0
 
 
@@ -108,11 +150,16 @@ class Session:
                  eye_state: Callable[[], dict] = dict,
                  on_status: Callable[[str], None] = lambda s: None,
                  on_slew: Callable[[Slew], None] = lambda s: None,
-                 on_frame: Callable[[np.ndarray, float], None] = lambda f, z: None):
+                 on_frame: Callable[[np.ndarray, float], None] = lambda f, z: None,
+                 cue: Callable[[str], None] = lambda name: None, say: Callable[[str], None] = lambda text: None):
         self.dev, self.run_dir, self.subject = dev, Path(run_dir), subject
+        self.cue, self.say = cue, say
         self.eye_state, self.on_status, self.on_slew, self.on_frame = eye_state, on_status, on_slew, on_frame
         self.n = 0
         self.run = 0
+        self.test_id = 0
+        self.context: dict = {}     # test, location, tracker depth: saved with every slew
+        self._said_go = False
         self.plane_um: Optional[float] = None
 
     def _next_name(self, kind: str) -> str:
@@ -134,7 +181,7 @@ class Session:
         sx, sy, _ = self.dev.stage.get_position()
         eye = self.eye_state() or {}
         return dict(experiment=self.run_dir.name, subject=self.subject, settings=asdict(st), stage_x_um=sx, stage_y_um=sy,
-                    target_r_mm=st.target_r_mm, target_phi_deg=st.target_phi_deg, **eye)
+                    target_r_mm=st.target_r_mm, target_phi_deg=st.target_phi_deg, **eye, **self.context)
 
     def find(self, st: Settings, direction: float, start_um: Optional[float], search_um: float, stop: threading.Event,
              *, label: str = "single", cycle: Optional[int] = None, gated: bool = True) -> Slew:
@@ -180,6 +227,8 @@ class Session:
                    background_mean=r.background_mean, background_std=r.background_std, peak_snr=snr, z_at_max_um=z_max,
                    lo_v=lo, file=name)
         self._log(row)
+        if status in ("missed", "rejected", "no data"):
+            self.cue("miss")
         slew = Slew(status, z, row, rec)
         self.on_slew(slew)
         return slew
@@ -210,6 +259,7 @@ class Session:
             self.dev.camera.set_emccd_gain(st.gain)
         self.open_shutters()
         misses = 0
+        deltas = []
         try:
             for k in range(st.n_cycles):
                 if stop.is_set():
@@ -234,9 +284,203 @@ class Session:
                                   label="round_trip", cycle=k)
                 if s_out.status in counts:
                     counts[s_out.status] += 1
+                if s_in.status == "found" and s_out.status == "found":
+                    deltas.append(s_in.z_um - s_out.z_um)
         finally:
             self.retract(st)
+        counts["sigma_um"] = float(np.std(deltas, ddof=1) / math.sqrt(2.0)) if len(deltas) > 1 else None
         return counts
+
+    def _fresh_eye(self, stop: threading.Event, t_since: float) -> Optional[tuple[float, float]]:
+        """A pupil reading taken after t_since (time.monotonic). Waits through a blink; None if none comes."""
+        t_end = time.monotonic() + EYE_WAIT_S
+        while time.monotonic() < t_end and not stop.is_set():
+            eye = self.eye_state() or {}
+            x, y, age = eye.get("eye_x_mm"), eye.get("eye_y_mm"), eye.get("eye_age_s")
+            if x is not None and y is not None and age is not None and time.monotonic() - age > t_since:
+                return float(x), float(y)
+            time.sleep(0.02)
+        return None
+
+    def _center(self, st: Settings, stop: threading.Event, allowance_mm: float = 0.0) -> str:
+        """Closed loop, as nobody is watching: re-reads the pupil after every move and gives up unless the error
+        shrinks, which also catches a wrong move direction. allowance_mm: how far the target itself moved from the
+        last centered location. Returns what went wrong, or an empty string."""
+        r, phi = st.target_r_mm or 0.0, st.target_phi_deg or 0.0
+        tx, ty = _target_xy(r, phi)
+        limit_mm = MAX_AUTO_XY_MOVE_UM / 1000.0 + allowance_mm
+        previous = None
+        t_since = time.monotonic() - MAX_EYE_AGE_S
+        for attempt in range(CENTER_MOVES + 1):
+            xy = self._fresh_eye(stop, t_since)
+            if stop.is_set():
+                return ""
+            if xy is None:
+                return NO_PUPIL
+            err_mm = math.hypot(xy[0] - tx, xy[1] - ty)
+            if err_mm <= CENTER_TOL_MM:
+                return ""
+            if err_mm > limit_mm:
+                return f"centering needs {err_mm:.1f} millimeters, too far"
+            if previous is not None and err_mm > 0.7 * previous:
+                return "centering is not converging"
+            if attempt == CENTER_MOVES:
+                break
+            dx, dy, _ = xy_move_for_target(r, phi, xy, limit_mm * 1000.0)
+            self.plane_um = None
+            self.dev.stage.move_rel(dx=dx, dy=dy)
+            t_since = time.monotonic()
+            time.sleep(STAGE_SETTLE_S)
+            previous = err_mm
+        return "centering is not converging"
+
+    def _tracker_plane(self, stop: threading.Event) -> Optional[float]:
+        """Median over a few frames of where the eye tracker puts the cornea, in lens z."""
+        values = []
+        t_end = time.monotonic() + Z_READ_S
+        while time.monotonic() < t_end and not stop.is_set():
+            v = (self.eye_state() or {}).get("eye_plane_um")
+            if v is not None:
+                values.append(float(v))
+            time.sleep(0.03)
+        return float(np.median(values)) if values else None
+
+    def _search_start(self, st: Settings, z_tracker: Optional[float]) -> float:
+        """Margin in front of the tracker's plane, or the retract position if that is not a sensible place."""
+        if z_tracker is None:
+            return st.retract_um
+        start = z_tracker - st.z_margin_um
+        if start > st.retract_um + MAX_AUTO_Z_MOVE_UM or start + st.stop_after_um >= st.ceiling_um:
+            return st.retract_um
+        return start
+
+    def _countdown(self, st: Settings, stop: threading.Event) -> None:
+        n = int(round(st.settle_s))
+        for _ in range(n):
+            self.cue("count")
+            if stop.wait(1.0):
+                return
+        if st.settle_s > n:
+            stop.wait(st.settle_s - n)
+
+    def auto_test(self, st: Settings, stop: threading.Event) -> dict:
+        """One click, for a subject who cannot see the screen: lens back, countdown to settle and fixate, then at
+        every location in random order: XYZ centering, shutters open, search for the plane, round trips, lens back,
+        shutters closed. Says the result out loud."""
+        c = self._auto_test(st, stop)
+        ended = c["ended"]
+        total = c["found"] + c["rejected"] + c["missed"]
+        all_found = c["found"] > 0 and c["rejected"] == 0 and c["missed"] == 0 and not c["n_failed"]
+        self.cue("stopped" if ended == "stopped" else "success" if ended == "done" and all_found
+                 else "partial" if c["found"] > 0 else "failed")
+        if ended == "stopped":
+            self.say("Stopped")
+        elif total == 0 and c["n_locations"] <= 1:
+            self.say(ended)
+        elif total == 0:
+            self.say(f"No planes. {ended}")
+        else:
+            sigma = f", short term sigma {c['sigma_um']:.0f} microns" if c.get("sigma_um") is not None else ""
+            failed = f", {c['n_failed']} of {c['n_locations']} locations failed" if c["n_failed"] else ""
+            early = "" if ended == "done" else ", ended early"
+            self.say(f"{c['found']} of {total} found{sigma}{failed}{early}")
+        return c
+
+    def _test_location(self, st: Settings, stop: threading.Event, allowance_mm: float) -> dict:
+        """Returns the counts of this location; ended says why it stopped, "done" if it ran."""
+        none = dict(cycles=0, found=0, rejected=0, missed=0, sigma_um=None)
+        self.plane_um = None
+        self.dev.lens.move_abs(st.retract_um)
+        z_tracker = None
+        if st.center_first:
+            why = self._center(st, stop, allowance_mm)
+            if why:
+                return dict(none, ended=why, centered=False)
+            if stop.is_set():
+                return dict(none, ended="stopped", centered=False)
+            z_tracker = self._tracker_plane(stop)
+        start = self._search_start(st, z_tracker)
+        self.context.update(z_tracker_um=z_tracker)
+        if stop.is_set():
+            return dict(none, ended="stopped", centered=True)
+        if not self._said_go:
+            self._said_go = True
+            self.cue("go")
+        self.open_shutters()
+        try:
+            s = self.find(st, 1.0, start, st.search_um, stop, label="search", gated=False)
+            fell_back = False
+            if s.status == "missed" and start > st.retract_um + 50.0:   # the tracker may have put it past the cornea
+                fell_back = True
+                s = self.find(st, 1.0, st.retract_um, st.search_um, stop, label="search_fallback", gated=False)
+        except Exception:
+            self.retract(st)
+            raise
+        info = dict(centered=True, z_tracker_um=z_tracker, z_start_um=start, fell_back=fell_back,
+                    z_search_um=s.z_um)
+        if s.status != "found":
+            self.retract(st)
+            return dict(none, ended="stopped" if s.status == "stopped" else NO_PLANE, **info)
+        return dict(self.round_trips(st, stop), **info)
+
+    def _log_location(self, row: dict) -> None:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        path = self.run_dir / "locations.csv"
+        new = not path.exists()
+        with open(path, "a", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=LOCATION_FIELDS, extrasaction="ignore")
+            if new:
+                w.writeheader()
+            w.writerow(row)
+
+    def _auto_test(self, st: Settings, stop: threading.Event) -> dict:
+        st.validate()
+        locations = list(st.locations) or [(st.target_r_mm or 0.0, st.target_phi_deg or 0.0)]
+        seed = random.randrange(1 << 31)
+        random.Random(seed).shuffle(locations)
+        self.test_id += 1
+        self.dev.lens.move_abs(st.retract_um)
+        self._said_go = False
+        self._countdown(st, stop)
+        total = dict(cycles=0, found=0, rejected=0, missed=0, n_locations=len(locations), n_failed=0, n_ran=0,
+                     ended="done")
+        variances = []
+        previous = (0.0, 0.0)   # the head is expected near the pupil center, whichever location comes first
+        no_pupil = 0
+        for i, (r, phi) in enumerate(locations):
+            if stop.is_set():
+                total["ended"] = "stopped"
+                break
+            one = replace(st, target_r_mm=r, target_phi_deg=phi)
+            self.on_status(f"Location {i + 1}/{len(locations)}: R {r:g} mm, phi {phi:g} deg")
+            self.context = dict(test=self.test_id, location=i, seed=seed)
+            c = self._test_location(one, stop, math.dist(_target_xy(r, phi), _target_xy(*previous)))
+            for k in ("cycles", "found", "rejected", "missed"):
+                total[k] += c[k]
+            if c.get("sigma_um") is not None:
+                variances.append(c["sigma_um"] ** 2)
+            if c.get("centered"):
+                previous = (r, phi)
+            self._log_location(dict(c, test=self.test_id, order=i, seed=seed, r_mm=r, phi_deg=phi))
+            self.on_status(f"R {r:g} mm, phi {phi:g} deg: {c['ended']}, {c['found']} found, {c['rejected']} rejected, "
+                           f"{c['missed']} missed")
+            if c["ended"] == "stopped":
+                total["ended"] = "stopped"
+                break
+            if c["ended"] == "done":
+                total["n_ran"] += 1
+            else:
+                total["n_failed"] += 1
+                total["last_problem"] = c["ended"]
+            no_pupil = no_pupil + 1 if c["ended"] == NO_PUPIL else 0
+            if no_pupil >= MAX_NO_PUPIL:
+                total["ended"] = NO_PUPIL
+                break
+        self.retract(st)
+        if total["ended"] == "done" and total["n_failed"] == len(locations):
+            total["ended"] = total["last_problem"]
+        total["sigma_um"] = math.sqrt(sum(variances) / len(variances)) if variances else None
+        return total
 
     def single_find(self, st: Settings, direction: float, stop: threading.Event) -> Slew:
         """From the current z, then back to where it started."""

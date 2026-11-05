@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -20,19 +21,23 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import (
-    QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
+    QCheckBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
     QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from brillouin_system.eye_tracker.eye_position.coordinates import RigCoord
 from brillouin_system.eye_tracker.eye_tracker_results import get_eye_tracker_results
 from brillouin_system.guis.plane_accuracy_test.plane_accuracy_gui import _dspin, connect_devices
+from brillouin_system.guis.plane_vivo_test import cues
 from brillouin_system.guis.plane_vivo_test.bounded_lens import BoundedLens
-from brillouin_system.guis.plane_vivo_test.session import Session, Settings, Slew, xy_move_for_target
+from brillouin_system.guis.plane_vivo_test.session import (
+    Session, Settings, Slew, parse_locations, xy_move_for_target,
+)
 from brillouin_system.scan_managers.homodyne_plane_finder import PRE_ROLL_S, HomodyneFinderParams, zero_phase_s
 
 DEFAULT_SAVE_DIR = Path.home() / "plane_vivo_runs"
 EYE_MAX_AGE_S = 0.3
+DEFAULT_LOCATIONS = "0,0; 1,0; 1,90; 1,180; 1,270; 2,0; 2,90; 2,180; 2,270"
 EYE_STALE_S = 30.0      # generous: the first frame comes after the tracker process has started
 BLUE, ORANGE, RED, GRAY = "#2a78d6", "#eb6834", "#c0392b", "#8a8a85"
 
@@ -47,6 +52,7 @@ class Worker(QObject):
     slew = pyqtSignal(object)
     frame = pyqtSignal(object, float)
     failed = pyqtSignal(str)
+    test_result = pyqtSignal(str)
 
     def __init__(self, use_dummy: bool, lens_port: str, stage_port: str, ni_device: str, run_dir: Path, subject: str):
         super().__init__()
@@ -77,7 +83,7 @@ class Worker(QObject):
             self.dev.daq.configure(sample_rate_hz=5000.0)
             self.session = Session(self.dev, self.run_dir, self.subject, eye_state=self._eye_snapshot,
                                    on_status=self.status.emit, on_slew=self.slew.emit,
-                                   on_frame=lambda f, z: self.frame.emit(f, z))
+                                   on_frame=lambda f, z: self.frame.emit(f, z), cue=cues.play, say=cues.say)
             self._emit_positions()
             self.connected.emit("")
         except Exception as e:
@@ -87,6 +93,8 @@ class Worker(QObject):
         try:
             fn()
         except Exception as e:
+            cues.play("failed")
+            cues.say("Error, see the screen")
             self.failed.emit(f"{type(e).__name__}: {e}")
         try:
             self._emit_positions()
@@ -131,6 +139,16 @@ class Worker(QObject):
                              f"{c['rejected']} rejected, {c['missed']} missed. Lens retracted, shutters closed.")
         self._guarded(go)
 
+    @pyqtSlot(object)
+    def auto_test(self, st: Settings):
+        def go():
+            self.stop.clear()
+            c = self.session.auto_test(st, self.stop)
+            self.test_result.emit(f"Last test ({c['ended']}): {c['n_ran']}/{c['n_locations']} "
+                                  f"locations, {c['cycles']} round trips, {c['found']} found, "
+                                  f"{c['rejected']} rejected, {c['missed']} missed")
+        self._guarded(go)
+
     @pyqtSlot()
     def shutdown(self):
         try:
@@ -158,6 +176,7 @@ class PlaneVivoWindow(QWidget):
     _req_shutter = pyqtSignal(bool)
     _req_single = pyqtSignal(object, float)
     _req_trips = pyqtSignal(object)
+    _req_test = pyqtSignal(object)
     _req_shutdown = pyqtSignal()
     _req_eye_shutdown = pyqtSignal()
 
@@ -197,6 +216,8 @@ class PlaneVivoWindow(QWidget):
         self._req_shutter.connect(self._worker.set_shutter)
         self._req_single.connect(self._worker.single_find)
         self._req_trips.connect(self._worker.round_trips)
+        self._req_test.connect(self._worker.auto_test)
+        self._worker.test_result.connect(self.test_label.setText)
         self._req_shutdown.connect(self._worker.shutdown)
         self._thread.start()
         self._set_busy(True)
@@ -251,14 +272,17 @@ class PlaneVivoWindow(QWidget):
         now = time.monotonic()
         if res.laser_position is None:
             self._eye = None
-            self._worker.eye_state = dict(eye_x_mm=None, eye_y_mm=None, eye_dc_mm=None, eye_t=now)
+            self._worker.eye_state = dict(eye_x_mm=None, eye_y_mm=None, eye_dc_mm=None, eye_plane_um=None,
+                                          eye_lens_um=self._lens, eye_t=now)
             self.eye_label.setText("Pupil not found")
             return
         self._eye, self._eye_t = res, now
         x, y, _ = res.laser_position
         dc = res.delta_laser_corner
+        # _lens is only refreshed between actions; the cornea in lens z is right whichever lens z went into dc
         self._worker.eye_state = dict(eye_x_mm=float(x), eye_y_mm=float(y), eye_dc_mm=None if dc is None else float(dc),
-                                      eye_t=now)
+                                      eye_plane_um=None if dc is None else self._lens + 1000.0 * float(dc),
+                                      eye_lens_um=self._lens, eye_t=now)
         dc_text = "—" if dc is None else f"{dc:+.3f}"
         self.eye_label.setText(f"Laser at x {x:+.3f}, y {y:+.3f} mm from pupil center "
                                f"(R {np.hypot(x, y):.2f} mm)   Δc {dc_text} mm")
@@ -290,6 +314,14 @@ class PlaneVivoWindow(QWidget):
         self.stop_btn.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 8px;")
         self.stop_btn.clicked.connect(self._stop)
         left.addWidget(self.stop_btn)       # outside the scroll area: always in view
+        self.test_btn = QPushButton()
+        self.test_btn.setMinimumHeight(110)
+        self.test_btn.clicked.connect(self._test_clicked)
+        left.addWidget(self.test_btn)
+        self.test_label = QLabel("")
+        self.test_label.setWordWrap(True)
+        self.test_label.setStyleSheet("font-weight: bold;")
+        left.addWidget(self.test_label)
         left.addWidget(scroll, 1)
 
         g = QGroupBox("Lens safety (+z moves toward the eye)")
@@ -379,7 +411,7 @@ class PlaneVivoWindow(QWidget):
                              "but does not update the estimate.")
         self.cycles = QSpinBox()
         self.cycles.setRange(1, 1000)
-        self.cycles.setValue(10)
+        self.cycles.setValue(4)
         self.max_misses = QSpinBox()
         self.max_misses.setRange(1, 100)
         self.max_misses.setValue(3)
@@ -392,6 +424,22 @@ class PlaneVivoWindow(QWidget):
                          ("End after misses:", self.max_misses), ("Andor frame depth:", self.depth),
                          ("Andor exposure:", self.exposure), ("Andor gain:", self.gain)):
             f.addRow(label, w)
+        self.settle = _dspin(0.0, 30.0, 3.0, 1.0, 0, " s")
+        self.settle.setToolTip("Beeps once a second after the click. Centering follows, then a higher beep and the "
+                               "shutters open.")
+        f.addRow("Countdown:", self.settle)
+        self.center_first = QCheckBox("Center XYZ at every location with the eye tracker")
+        self.center_first.setChecked(True)
+        self.center_first.setToolTip("XY re-reads the pupil after every move. If it cannot center, that location is "
+                                     "skipped with the shutters closed. Z only chooses where the search starts.")
+        self.locations = QLineEdit(DEFAULT_LOCATIONS)
+        self.locations.setToolTip("R mm, phi deg; separated by semicolons. Each click runs all of them in a new random "
+                                  "order, with the round trips above at each.")
+        f.addRow("Locations:", self.locations)
+        self.z_margin = _dspin(100.0, 3000.0, 1000.0, 100.0, 0, " um")
+        self.z_margin.setToolTip("The search starts this far in front of where the eye tracker puts the cornea.")
+        f.addRow("Depth margin:", self.z_margin)
+        f.addRow(self.center_first)
         self.plane_label = QLabel("Plane estimate: none, run a single find first")
         f.addRow(self.plane_label)
         self.trips_btn = QPushButton("Run round trips")
@@ -431,14 +479,55 @@ class PlaneVivoWindow(QWidget):
         self.log_box.setReadOnly(True)
         right.addWidget(self.log_box, 1)
         root.addLayout(right, 1)
-        self._controls = [w for w in panel.findChildren(QPushButton) if w is not self.stop_btn]
+        self._controls = panel.findChildren(QPushButton)
+        self._testing = False
+        self._last_stop_t = 0.0
+        self._update_test_btn()
 
     # ------------------------------------------------------------------ helpers
     def _log(self, text: str):
         self.log_box.appendPlainText(f"{datetime.now().strftime('%H:%M:%S')}  {text}")
 
+    def _update_test_btn(self):
+        if self._testing:
+            text, col = "RUNNING: click to stop", "#c0392b"
+        elif not self._ceiling_set:
+            text, col = "RUN TEST\n(set the lens limit first)", "#8a8a85"
+        else:
+            text, col = "RUN TEST", "#2e8b57"
+        self.test_btn.setText(text)
+        self.test_btn.setStyleSheet(f"background-color: {col}; color: white; font-weight: bold; font-size: 20pt;")
+        self.test_btn.setEnabled(self._testing or (self._ceiling_set and not self._busy))
+
+    def _test_clicked(self):
+        if self._testing:
+            self._stop()
+            return
+        if time.monotonic() - self._last_stop_t < 1.0:
+            return      # the second click of a double click on stop must not start a new test
+        try:
+            st = replace(self._settings(), locations=parse_locations(self.locations.text()),
+                         z_margin_um=self.z_margin.value())
+            if not st.center_first:
+                st = replace(st, locations=())
+            st.validate()
+        except ValueError as e:
+            # no dialog: the subject cannot see it, and it would swallow the next click
+            self.test_label.setText(str(e))
+            cues.play("failed")
+            cues.say("Settings error, see the screen")
+            return
+        self._worker.session.subject = self.subject_edit.text().strip()
+        self._testing = True
+        self.test_label.setText("Searching for the plane ...")
+        self._set_busy(True)
+        self._req_test.emit(st)
+
     def _set_busy(self, busy: bool):
         self._busy = busy
+        if not busy:
+            self._testing = False
+        self._update_test_btn()
         for b in self._controls:
             b.setEnabled(not busy)
         if not busy:
@@ -467,6 +556,9 @@ class PlaneVivoWindow(QWidget):
 
     def _on_failed(self, msg: str):
         self._log(f"ERROR: {msg}")
+        if self._testing:   # no dialog: the subject cannot see it, and it would swallow the next click
+            self.test_label.setText(f"ERROR: {msg}")
+            return
         QMessageBox.warning(self, "Error", msg)
 
     def _apply_ceiling(self):
@@ -478,6 +570,7 @@ class PlaneVivoWindow(QWidget):
             if r != QMessageBox.Yes:
                 return
         self._ceiling_set = True
+        self._update_test_btn()
         self.ceiling_label.setText(f"Limit {um:.1f} um")
         self.ceiling_label.setStyleSheet("")
         self._set_busy(True)
@@ -501,7 +594,8 @@ class PlaneVivoWindow(QWidget):
                         search_um=self.search.value(), approach_um=self.approach.value(), gate_um=self.gate.value(),
                         n_cycles=self.cycles.value(), max_misses=self.max_misses.value(),
                         frame_depth_um=self.depth.value(), exposure_s=self.exposure.value(), gain=self.gain.value(),
-                        target_r_mm=self.target_r.value(), target_phi_deg=self.target_phi.value())
+                        target_r_mm=self.target_r.value(), target_phi_deg=self.target_phi.value(),
+                        settle_s=self.settle.value(), center_first=self.center_first.isChecked())
 
     def _single(self, direction: float):
         self._worker.session.subject = self.subject_edit.text().strip()
@@ -522,6 +616,7 @@ class PlaneVivoWindow(QWidget):
     def _stop(self):
         """Shutters first and directly, without waiting for the worker. The worker retracts when it ends its find."""
         self._worker.stop.set()
+        self._last_stop_t = time.monotonic()
         dev = self._worker.dev
         if dev is not None and dev.shutters is not None:
             threading.Thread(target=dev.shutters.close_all, daemon=True).start()
