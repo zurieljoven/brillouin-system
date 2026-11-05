@@ -3,7 +3,7 @@
 A plan is a TOML file: one ``[defaults]`` table whose values apply to every
 step, plus an array of ``[[step]]`` tables that override only what differs.
 Each step expands into ``replicates`` sweep scans, whose IDs are
-``depth<depth_um>num<k>`` — the same identifier the acquisition code tags each
+``R<R_mm>_phi<phi_deg>_d<depth_um>_n<k>`` — the same identifier the acquisition code tags each
 sweep scan with, so a saved scan can be matched back to the step that asked
 for it.
 
@@ -62,7 +62,7 @@ class PlanEntry:
 class PlanStep:
     """One expanded step: a single sweep scan the operator will take."""
     depth_um: float
-    num: int                 # replicate number within this depth (1-based)
+    num: int                 # replicate number at this location and depth (1-based)
     timed: bool
     cycles: int | None
     max_time_s: float
@@ -73,7 +73,8 @@ class PlanStep:
 
     @property
     def id(self) -> str:
-        return f"depth{_fmt_depth(self.depth_um)}num{self.num}"
+        return (f"R{_fmt_depth(self.R_mm)}_phi{_fmt_depth(self.phi_deg)}"
+                f"_d{_fmt_depth(self.depth_um)}_n{self.num}")
 
     def mode_str(self) -> str:
         budget = f"{self.max_time_s:g} s" if self.max_time_s > 0 else "no cap"
@@ -188,18 +189,23 @@ def expand_plan(entries: Iterable[PlanEntry],
                 rng: random.Random | None = None) -> list[PlanStep]:
     """Expand entries into individual steps.
 
-    Steps are grouped by depth; replicate numbers increase monotonically
-    within a depth. When scrambling, depths are interleaved randomly but each
-    depth keeps its replicate order (and therefore its num1, num2, … numbering).
+    Steps are grouped by depth; replicate numbers count per (R, phi, depth), so
+    an ID always means the same location and replicate. When scrambling, depths
+    are interleaved randomly but each depth keeps its file order (and therefore
+    every location's n1, n2, … numbering).
     """
     groups: "OrderedDict[float, list[PlanEntry]]" = OrderedDict()
     for e in entries:
         for _ in range(e.replicates):
             groups.setdefault(e.depth_um, []).append(e)
 
-    def _step(e: PlanEntry, num: int) -> PlanStep:
+    counters: dict[tuple[float, float, float], int] = {}
+
+    def _step(e: PlanEntry) -> PlanStep:
+        key = (e.R_mm, e.phi_deg, e.depth_um)
+        counters[key] = counters.get(key, 0) + 1
         return PlanStep(
-            depth_um=e.depth_um, num=num, timed=e.timed, cycles=e.cycles,
+            depth_um=e.depth_um, num=counters[key], timed=e.timed, cycles=e.cycles,
             max_time_s=e.max_time_s, R_mm=e.R_mm, phi_deg=e.phi_deg,
             delta_c_mm=e.delta_c_mm, motion_limit_um=e.motion_limit_um,
         )
@@ -207,20 +213,17 @@ def expand_plan(entries: Iterable[PlanEntry],
     if not scramble:
         out: list[PlanStep] = []
         for reps in groups.values():
-            for i, e in enumerate(reps, start=1):
-                out.append(_step(e, i))
+            for e in reps:
+                out.append(_step(e))
         return out
 
     rng = rng or random.Random()
     remaining = OrderedDict((d, list(reps)) for d, reps in groups.items())
-    counters = {d: 0 for d in groups}
     sequence: list[PlanStep] = []
     while any(remaining.values()):
         avail = [d for d, reps in remaining.items() if reps]
         d = rng.choice(avail)
-        e = remaining[d].pop(0)
-        counters[d] += 1
-        sequence.append(_step(e, counters[d]))
+        sequence.append(_step(remaining[d].pop(0)))
     return sequence
 
 

@@ -770,7 +770,7 @@ class HiFrontend(QWidget):
 
         # --- Axial scan (step mode) controls ---
         self.axial_id_input = QLineEdit()
-        self.axial_id_input.setFixedWidth(80)
+        self.axial_id_input.setFixedWidth(150)  # predefined IDs: R2_phi90_d150_n2
         self.axial_num_input = QLineEdit("10")
         self.axial_num_input.setFixedWidth(80)
         self.axial_num_input.textChanged.connect(self.update_axial_step_distance)
@@ -885,7 +885,7 @@ class HiFrontend(QWidget):
     #   delta_c_mm       target Δc [mm]                    -> Move Z
     #   motion_limit_um  motion quality gate [µm] (0 = off)
     #
-    # Each step expands into `replicates` sweep scans, IDs "depth<depth_um>num<k>".
+    # Each step expands into `replicates` sweep scans, IDs "R<R_mm>_phi<phi_deg>_d<depth_um>_n<k>".
     # Running a step: set the R/phi/Δc fields, Move XYZ, push the parameters
     # into the sweep config (preserving every other tuned field), name the ID,
     # then take the (timed or fixed) sweep scan carrying the motion limit — a
@@ -918,9 +918,9 @@ class HiFrontend(QWidget):
 
         self.predef_scramble_btn = QPushButton("Scramble")
         self.predef_scramble_btn.setToolTip(
-            "Randomise the order of depths and replicates. Each depth's "
-            "replicate numbers still increase monotonically (num1 before "
-            "num2, …).")
+            "Randomise the order of depths and replicates. Each location's "
+            "replicate numbers still increase monotonically (n1 before "
+            "n2, …).")
         self.predef_scramble_btn.clicked.connect(self.on_scramble_predefined)
 
         io_row = QHBoxLayout()

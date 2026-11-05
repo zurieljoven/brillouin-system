@@ -2,7 +2,7 @@
 #
 # [defaults] applies to EVERY step; each [[step]] overrides only what differs,
 # so a typical plan is just a list of depths. Each step expands into
-# `replicates` sweep scans, with IDs "depth<depth_um>num<k>".
+# `replicates` sweep scans, with IDs "R<R_mm>_phi<phi_deg>_d<depth_um>_n<k>".
 #
 # Fields (all optional in a [[step]] except depth_um; unset ones inherit
 # [defaults], and unset defaults fall back to the built-in values shown here):

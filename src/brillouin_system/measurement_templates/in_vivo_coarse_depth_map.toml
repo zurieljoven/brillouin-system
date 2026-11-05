@@ -1,8 +1,7 @@
 # In vivo coarse depth map: 5 depths x 9 locations x 3 replicates = 135 scans, 4 round trips each.
 # Import, then press Scramble. Depths mix on Scramble; the locations within a depth are already
 # shuffled here in blocks, because Scramble keeps each depth's file order.
-# IDs (depth<d>num<k>) do not name the location. k counts the [[step]] tables of that depth in this
-# file, so keep this file with the data and do not edit it after the first scan.
+# IDs name the location, depth and replicate: R2_phi90_d150_n2.
 # max_time_s = 0: a 15 s cap would end a scan after about 2 round trips at 400 um/s.
 # Generated with seed 20261105.
 

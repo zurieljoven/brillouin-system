@@ -83,8 +83,8 @@ def test_example_template_parses_and_expands():
     # 5 depths in the example, 5 replicates each except overrides are per-depth.
     steps = expand_plan(entries)
     ids = [s.id for s in steps]
-    assert "depth50num1" in ids
-    assert "depth300num5" in ids
+    assert "R0_phi0_d50_n1" in ids
+    assert "R0_phi0_d300_n5" in ids
     # depth 400 is fixed-mode with 8 cycles.
     d400 = [s for s in steps if s.depth_um == 400][0]
     assert d400.timed is False
@@ -121,10 +121,39 @@ motion_limit_um = 50
 replicates = 1
 """)
     steps = expand_plan(parse_plan_toml(path))
-    assert [s.id for s in steps] == ["depth60num1", "depth60num2", "depth120num1"]
+    assert [s.id for s in steps] == ["R0_phi0_d60_n1", "R0_phi0_d60_n2", "R0_phi0_d120_n1"]
     assert all(s.max_time_s == 12 for s in steps)
     assert steps[0].motion_limit_um == 25
     assert steps[2].motion_limit_um == 50
+
+
+def test_ids_name_location_and_count_per_location(tmp_path):
+    path = _write(tmp_path, """
+[defaults]
+mode = "fixed"
+replicates = 1
+
+[[step]]
+depth_um = 150
+R_mm = 2
+phi_deg = 90
+
+[[step]]
+depth_um = 150
+R_mm = 1.5
+phi_deg = -75
+
+[[step]]
+depth_um = 150
+R_mm = 2
+phi_deg = 90
+""")
+    entries = parse_plan_toml(path)
+    assert [s.id for s in expand_plan(entries)] == [
+        "R2_phi90_d150_n1", "R1.5_phi-75_d150_n1", "R2_phi90_d150_n2"]
+    scrambled = expand_plan(entries, scramble=True, rng=random.Random(0))
+    assert {s.id: s.R_mm for s in scrambled} == {
+        "R2_phi90_d150_n1": 2.0, "R1.5_phi-75_d150_n1": 1.5, "R2_phi90_d150_n2": 2.0}
 
 
 def test_missing_depth_is_error(tmp_path):
@@ -203,25 +232,25 @@ def test_cycle_actual_depths_skips_frameless_and_single_crossing():
 def test_build_progress_counts_and_matching():
     from brillouin_system.guis.human_interface.predefined_plan import PlanEntry
     steps = expand_plan([PlanEntry(50, 2, True, None, 10, 0, 0, 0, 30)])
-    # step depth50num1 taken with one within-limit frame; depth50num2 not taken.
+    # step R0_phi0_d50_n1 taken with one within-limit frame; R0_phi0_d50_n2 not taken.
     scans = [
-        _scan("depth50num1", deltas_from=[(100, 115)], positions=[155.0]),
-        _scan("depth999num1", deltas_from=[(100, 105)], positions=[155.0]),
+        _scan("R0_phi0_d50_n1", deltas_from=[(100, 115)], positions=[155.0]),
+        _scan("R0_phi0_d999_n1", deltas_from=[(100, 105)], positions=[155.0]),
     ]
     report = build_progress(steps, scans)
     assert report.planned_total == 2
     assert report.taken_count == 1
     assert report.frames_total == 1
     assert report.frames_pass == 1
-    assert report.remaining_ids() == ["depth50num2"]
-    assert report.unmatched_scan_ids == ["depth999num1"]
+    assert report.remaining_ids() == ["R0_phi0_d50_n2"]
+    assert report.unmatched_scan_ids == ["R0_phi0_d999_n1"]
 
 
 def test_build_progress_per_frame_pass_fail_within_one_scan():
     from brillouin_system.guis.human_interface.predefined_plan import PlanEntry
     steps = expand_plan([PlanEntry(50, 1, True, None, 10, 0, 0, 0, 30)])
     # One scan, three frames: deltas 10 (pass), 20 (pass), 40 (fail) vs limit 30.
-    scan = _scan("depth50num1",
+    scan = _scan("R0_phi0_d50_n1",
                  deltas_from=[(100, 110), (200, 180), (300, 340)],
                  positions=[155.0, 245.0, 350.0])
     report = build_progress(steps, [scan])
