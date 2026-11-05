@@ -33,12 +33,14 @@ LENS_SETTLE_S = 0.05
 SHUTTER_SETTLE_S = 0.1
 MAX_XY_MOVE_UM = 3500.0     # as Move XY in the human interface
 MAX_AUTO_XY_MOVE_UM = 1500.0    # automatic centering, nobody watching: a bad pupil fit must not move far
-MAX_EYE_AGE_S = 0.5
-EYE_WAIT_S = 2.0            # rides out a blink
+EYE_WAIT_S = 3.0            # rides out a blink
+EYE_FRAMES = 3              # median over this many frames
+EYE_SKIP_AFTER_MOVE = 2     # frames to throw away after a stage move: the eye cameras expose for about 0.2 s
 Z_READ_S = 0.4
 MAX_AUTO_Z_MOVE_UM = 2000.0     # as Move Z in the human interface; further forward than this is not believed
 MAX_NO_PUPIL = 2            # locations in a row: the subject has moved away, stop
 NO_PUPIL = "no pupil found"
+WRONG_WAY = "centering moved the wrong way, stopping"
 NO_PLANE = "no plane found"
 CENTER_MOVES = 3
 CENTER_TOL_MM = 0.2
@@ -47,8 +49,8 @@ STAGE_SETTLE_S = 0.2
 LOG_FIELDS = ["n", "time", "t_perf", "label", "run", "cycle", "direction", "status", "z_um", "plane_before_um", "start_um",
               "search_um", "truncated", "s_peak", "threshold", "background_mean", "background_std", "peak_snr",
               "z_at_max_um", "lo_v", "stage_x_um", "stage_y_um", "target_r_mm", "target_phi_deg", "eye_x_mm", "eye_y_mm",
-              "eye_dc_mm", "eye_plane_um", "eye_lens_um", "eye_age_s", "test", "location", "z_tracker_um", "seed", "file"]
-LOCATION_FIELDS = ["test", "order", "seed", "r_mm", "phi_deg", "ended", "centered", "z_tracker_um", "z_start_um",
+              "eye_dc_mm", "eye_plane_um", "eye_lens_um", "eye_age_s", "test", "location", "z_tracker_um", "seed", "center_note", "file"]
+LOCATION_FIELDS = ["test", "order", "seed", "r_mm", "phi_deg", "ended", "center_note", "z_tracker_um", "z_start_um",
                    "fell_back", "z_search_um", "cycles", "found", "rejected", "missed", "sigma_um"]
 
 
@@ -158,6 +160,7 @@ class Session:
         self.n = 0
         self.run = 0
         self.test_id = 0
+        self.last_target = (0.0, 0.0)   # where the stage was last centered; until then the head is expected near R = 0
         self.context: dict = {}     # test, location, tracker depth: saved with every slew
         self._said_go = False
         self.plane_um: Optional[float] = None
@@ -291,28 +294,42 @@ class Session:
         counts["sigma_um"] = float(np.std(deltas, ddof=1) / math.sqrt(2.0)) if len(deltas) > 1 else None
         return counts
 
-    def _fresh_eye(self, stop: threading.Event, t_since: float) -> Optional[tuple[float, float]]:
-        """A pupil reading taken after t_since (time.monotonic). Waits through a blink; None if none comes."""
+    def _read_eye(self, stop: threading.Event, key: str, skip: int, n: int) -> list:
+        """Values of a key from the next new eye frames, after skipping some. The cameras expose for about 0.2 s and
+        frames are delivered late, so the frames right after a stage move still show the old position. Rides out a
+        blink. Frames are counted by eye_n; without new frames this returns nothing."""
+        values = []
+        last = (self.eye_state() or {}).get("eye_n")
+        seen = 0
         t_end = time.monotonic() + EYE_WAIT_S
-        while time.monotonic() < t_end and not stop.is_set():
+        while time.monotonic() < t_end and not stop.is_set() and len(values) < n:
             eye = self.eye_state() or {}
-            x, y, age = eye.get("eye_x_mm"), eye.get("eye_y_mm"), eye.get("eye_age_s")
-            if x is not None and y is not None and age is not None and time.monotonic() - age > t_since:
-                return float(x), float(y)
-            time.sleep(0.02)
-        return None
+            k = eye.get("eye_n")
+            if k is not None and k != last:
+                last = k
+                seen += 1
+                if seen > skip and eye.get(key) is not None:
+                    values.append(eye if key == "eye_x_mm" else float(eye[key]))
+            time.sleep(0.01)
+        return values
+
+    def _read_xy(self, stop: threading.Event, skip: int) -> Optional[tuple[float, float]]:
+        frames = self._read_eye(stop, "eye_x_mm", skip, EYE_FRAMES)
+        if not frames:
+            return None
+        return float(np.median([f["eye_x_mm"] for f in frames])), float(np.median([f["eye_y_mm"] for f in frames]))
 
     def _center(self, st: Settings, stop: threading.Event, allowance_mm: float = 0.0) -> str:
-        """Closed loop, as nobody is watching: re-reads the pupil after every move and gives up unless the error
-        shrinks, which also catches a wrong move direction. allowance_mm: how far the target itself moved from the
-        last centered location. Returns what went wrong, or an empty string."""
+        """Closed loop, as nobody is watching: re-reads the pupil after every move. Only a move that makes it clearly
+        worse is an error (WRONG_WAY); anything else is a note, and the plane test goes ahead wherever the laser is.
+        allowance_mm: how far the target itself moved from the last location."""
         r, phi = st.target_r_mm or 0.0, st.target_phi_deg or 0.0
         tx, ty = _target_xy(r, phi)
         limit_mm = MAX_AUTO_XY_MOVE_UM / 1000.0 + allowance_mm
         previous = None
-        t_since = time.monotonic() - MAX_EYE_AGE_S
+        skip = 0
         for attempt in range(CENTER_MOVES + 1):
-            xy = self._fresh_eye(stop, t_since)
+            xy = self._read_xy(stop, skip)
             if stop.is_set():
                 return ""
             if xy is None:
@@ -320,29 +337,21 @@ class Session:
             err_mm = math.hypot(xy[0] - tx, xy[1] - ty)
             if err_mm <= CENTER_TOL_MM:
                 return ""
+            if previous is not None and err_mm > 1.5 * previous + 0.1:
+                return WRONG_WAY
             if err_mm > limit_mm:
                 return f"centering needs {err_mm:.1f} millimeters, too far"
-            if previous is not None and err_mm > 0.7 * previous:
-                return "centering is not converging"
-            if attempt == CENTER_MOVES:
-                break
+            if attempt == CENTER_MOVES or (previous is not None and err_mm > 0.8 * previous):
+                return f"off target by {err_mm:.2f} millimeters"
             dx, dy, _ = xy_move_for_target(r, phi, xy, limit_mm * 1000.0)
-            self.plane_um = None
             self.dev.stage.move_rel(dx=dx, dy=dy)
-            t_since = time.monotonic()
             time.sleep(STAGE_SETTLE_S)
-            previous = err_mm
-        return "centering is not converging"
+            previous, skip = err_mm, EYE_SKIP_AFTER_MOVE
+        return ""
 
     def _tracker_plane(self, stop: threading.Event) -> Optional[float]:
         """Median over a few frames of where the eye tracker puts the cornea, in lens z."""
-        values = []
-        t_end = time.monotonic() + Z_READ_S
-        while time.monotonic() < t_end and not stop.is_set():
-            v = (self.eye_state() or {}).get("eye_plane_um")
-            if v is not None:
-                values.append(float(v))
-            time.sleep(0.03)
+        values = self._read_eye(stop, "eye_plane_um", 1, EYE_FRAMES)
         return float(np.median(values)) if values else None
 
     def _search_start(self, st: Settings, z_tracker: Optional[float]) -> float:
@@ -370,7 +379,8 @@ class Session:
         c = self._auto_test(st, stop)
         ended = c["ended"]
         total = c["found"] + c["rejected"] + c["missed"]
-        all_found = c["found"] > 0 and c["rejected"] == 0 and c["missed"] == 0 and not c["n_failed"]
+        all_found = c["found"] > 0 and c["rejected"] == 0 and c["missed"] == 0 and not c["n_failed"] \
+            and not c["n_off_target"]
         self.cue("stopped" if ended == "stopped" else "success" if ended == "done" and all_found
                  else "partial" if c["found"] > 0 else "failed")
         if ended == "stopped":
@@ -382,27 +392,31 @@ class Session:
         else:
             sigma = f", short term sigma {c['sigma_um']:.0f} microns" if c.get("sigma_um") is not None else ""
             failed = f", {c['n_failed']} of {c['n_locations']} locations failed" if c["n_failed"] else ""
+            failed += f", {c['n_off_target']} off target" if c["n_off_target"] else ""
             early = "" if ended == "done" else ", ended early"
             self.say(f"{c['found']} of {total} found{sigma}{failed}{early}")
         return c
 
     def _test_location(self, st: Settings, stop: threading.Event, allowance_mm: float) -> dict:
-        """Returns the counts of this location; ended says why it stopped, "done" if it ran."""
+        """Returns the counts of this location; ended says why it stopped, "done" if it ran. Eye tracker trouble does
+        not stop the plane test: it searches from wherever the laser is, and center_note says so."""
         none = dict(cycles=0, found=0, rejected=0, missed=0, sigma_um=None)
         self.plane_um = None
         self.dev.lens.move_abs(st.retract_um)
+        note = ""
         z_tracker = None
         if st.center_first:
-            why = self._center(st, stop, allowance_mm)
-            if why:
-                return dict(none, ended=why, centered=False)
+            note = self._center(st, stop, allowance_mm)
+            if note == WRONG_WAY:
+                return dict(none, ended=WRONG_WAY, center_note=note)
             if stop.is_set():
-                return dict(none, ended="stopped", centered=False)
-            z_tracker = self._tracker_plane(stop)
+                return dict(none, ended="stopped", center_note=note)
+            if note != NO_PUPIL:
+                z_tracker = self._tracker_plane(stop)
         start = self._search_start(st, z_tracker)
-        self.context.update(z_tracker_um=z_tracker)
+        self.context.update(z_tracker_um=z_tracker, center_note=note)
         if stop.is_set():
-            return dict(none, ended="stopped", centered=True)
+            return dict(none, ended="stopped", center_note=note)
         if not self._said_go:
             self._said_go = True
             self.cue("go")
@@ -416,11 +430,12 @@ class Session:
         except Exception:
             self.retract(st)
             raise
-        info = dict(centered=True, z_tracker_um=z_tracker, z_start_um=start, fell_back=fell_back,
+        info = dict(center_note=note, z_tracker_um=z_tracker, z_start_um=start, fell_back=fell_back,
                     z_search_um=s.z_um)
         if s.status != "found":
             self.retract(st)
-            return dict(none, ended="stopped" if s.status == "stopped" else NO_PLANE, **info)
+            ended = "stopped" if s.status == "stopped" else NO_PUPIL if note == NO_PUPIL else NO_PLANE
+            return dict(none, ended=ended, **info)
         return dict(self.round_trips(st, stop), **info)
 
     def _log_location(self, row: dict) -> None:
@@ -442,10 +457,9 @@ class Session:
         self.dev.lens.move_abs(st.retract_um)
         self._said_go = False
         self._countdown(st, stop)
-        total = dict(cycles=0, found=0, rejected=0, missed=0, n_locations=len(locations), n_failed=0, n_ran=0,
+        total = dict(cycles=0, found=0, rejected=0, missed=0, n_locations=len(locations), n_failed=0, n_ran=0, n_off_target=0,
                      ended="done")
         variances = []
-        previous = (0.0, 0.0)   # the head is expected near the pupil center, whichever location comes first
         no_pupil = 0
         for i, (r, phi) in enumerate(locations):
             if stop.is_set():
@@ -454,18 +468,20 @@ class Session:
             one = replace(st, target_r_mm=r, target_phi_deg=phi)
             self.on_status(f"Location {i + 1}/{len(locations)}: R {r:g} mm, phi {phi:g} deg")
             self.context = dict(test=self.test_id, location=i, seed=seed)
-            c = self._test_location(one, stop, math.dist(_target_xy(r, phi), _target_xy(*previous)))
+            c = self._test_location(one, stop, math.dist(_target_xy(r, phi), _target_xy(*self.last_target)))
             for k in ("cycles", "found", "rejected", "missed"):
                 total[k] += c[k]
             if c.get("sigma_um") is not None:
                 variances.append(c["sigma_um"] ** 2)
-            if c.get("centered"):
-                previous = (r, phi)
+            if c.get("center_note") == "":
+                self.last_target = (r, phi)
+            if c.get("center_note"):
+                total["n_off_target"] += 1
             self._log_location(dict(c, test=self.test_id, order=i, seed=seed, r_mm=r, phi_deg=phi))
             self.on_status(f"R {r:g} mm, phi {phi:g} deg: {c['ended']}, {c['found']} found, {c['rejected']} rejected, "
                            f"{c['missed']} missed")
-            if c["ended"] == "stopped":
-                total["ended"] = "stopped"
+            if c["ended"] in ("stopped", WRONG_WAY):
+                total["ended"] = c["ended"]
                 break
             if c["ended"] == "done":
                 total["n_ran"] += 1

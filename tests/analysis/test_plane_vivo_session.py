@@ -239,17 +239,34 @@ def test_speech_commands_quote_safely():
 
 class EyeOnStage:
     """Pupil reading that responds to the stage with the human interface's signs: stage +x moves the reading -x
-    (dx_stage = -dx_laser), stage +y moves it +y. wrong=True flips the response."""
+    (dx_stage = -dx_laser), stage +y moves it +y. wrong=True flips the response. Every call is a new frame, and a
+    frame shows the stage as it was late_frames ago, like the real cameras' 0.2 s exposure and delivery."""
 
-    def __init__(self, dev, x, y, wrong=False, plane=PLANE):
+    def __init__(self, dev, x, y, wrong=False, plane=PLANE, late_frames=0):
         self.dev, self.x, self.y, self.sign, self.plane = dev, x, y, -1.0 if wrong else 1.0, plane
         self.x0, self.y0, _ = dev.stage.get_position()
+        self.late, self.history, self.n = late_frames, [], 0
 
     def __call__(self):
-        sx, sy, _ = self.dev.stage.get_position()
-        return dict(eye_x_mm=self.x - self.sign * (sx - self.x0) / 1000.0,
-                    eye_y_mm=self.y + self.sign * (sy - self.y0) / 1000.0, eye_age_s=0.0,
-                    eye_plane_um=self.plane)
+        self.n += 1
+        self.history.append(self.dev.stage.get_position())
+        sx, sy, _ = self.history[max(0, len(self.history) - 1 - self.late)]
+        return dict(eye_x_mm=self.x - self.sign * (sx - self.x0) / 1000.0, eye_y_mm=self.y + self.sign * (sy - self.y0) / 1000.0,
+                    eye_age_s=0.0, eye_plane_um=self.plane, eye_n=self.n)
+
+
+class FixedEye:
+    """A reading that does not respond to the stage. new_frames=False: the cameras have stopped."""
+
+    def __init__(self, new_frames=True, **state):
+        self.state, self.new_frames, self.n = state, new_frames, 0
+
+    def __call__(self):
+        self.n += int(self.new_frames)
+        return dict(self.state, eye_n=self.n)
+
+
+NO_READING = dict(eye_x_mm=None, eye_y_mm=None, eye_plane_um=None)
 
 
 def test_centering_reaches_the_target_after_the_countdown(tmp_path):
@@ -263,28 +280,50 @@ def test_centering_reaches_the_target_after_the_countdown(tmp_path):
     assert abs(now["eye_x_mm"]) < 0.01 and abs(now["eye_y_mm"]) < 0.01
 
 
-@pytest.mark.parametrize("name, state, why", [
-    ("far", dict(eye_x_mm=5.0, eye_y_mm=0.0, eye_age_s=0.0), "too far"),
-    ("none", dict(eye_x_mm=None, eye_y_mm=None, eye_age_s=0.0), "no pupil found"),
-    ("old", dict(eye_x_mm=0.1, eye_y_mm=0.0, eye_age_s=99.0), "no pupil found"),
+def test_frames_from_before_the_move_do_not_stop_the_test(tmp_path):
+    # the failure seen on the rig: stage moved, no plane search at any location
+    dev = rig()
+    eye = EyeOnStage(dev, 0.3, -0.2, late_frames=2)
+    s = Session(dev, tmp_path / "a", eye_state=eye)
+    locs = ((1.0, 0.0), (1.0, 90.0), (2.0, 270.0))
+    c = s.auto_test(settings(center_first=True, locations=locs, n_cycles=1), threading.Event())
+    assert c["found"] == 6 and c["n_failed"] == 0 and c["n_off_target"] == 0
+
+
+@pytest.mark.parametrize("name, eye, note", [
+    ("no_reading", FixedEye(**NO_READING), "no pupil found"),
+    ("cameras_stopped", FixedEye(new_frames=False, eye_x_mm=0.1, eye_y_mm=0.0, eye_plane_um=PLANE), "no pupil found"),
+    ("far", FixedEye(eye_x_mm=5.0, eye_y_mm=0.0, eye_plane_um=PLANE), "too far"),
+    ("stage_does_nothing", FixedEye(eye_x_mm=0.8, eye_y_mm=0.0, eye_plane_um=PLANE), "off target"),
 ])
-def test_centering_refuses_a_bad_reading_without_moving_or_opening(tmp_path, name, state, why):
+def test_eye_tracker_trouble_still_tests_the_plane(tmp_path, name, eye, note):
+    dev = rig()
+    said = []
+    s = Session(dev, tmp_path / name, eye_state=eye, say=said.append)
+    c = s.auto_test(settings(center_first=True, target_r_mm=0.0, n_cycles=1), threading.Event())
+    assert c["found"] == 2 and c["n_off_target"] == 1 and c["n_failed"] == 0
+    assert note in locations_csv(tmp_path / name)[0]["center_note"]
+    assert said == ["2 of 2 found, 1 off target"]
+
+
+@pytest.mark.parametrize("name, eye", [("no_reading", FixedEye(**NO_READING)),
+                                       ("far", FixedEye(eye_x_mm=5.0, eye_y_mm=0.0, eye_plane_um=PLANE))])
+def test_the_stage_does_not_move_on_a_bad_reading(tmp_path, name, eye):
     dev = rig()
     before = dev.stage.get_position()
-    said = []
-    s = Session(dev, tmp_path / name, eye_state=lambda: state, say=said.append)
-    c = s.auto_test(settings(center_first=True, target_r_mm=0.0), threading.Event())
-    assert c["cycles"] == 0 and why in said[0] and dev.stage.get_position() == before
-    assert not (tmp_path / name / "slews.csv").exists()
+    Session(dev, tmp_path / name, eye_state=eye).auto_test(settings(center_first=True, target_r_mm=0.0, n_cycles=1),
+                                                           threading.Event())
+    assert dev.stage.get_position() == before
 
 
-def test_centering_gives_up_if_the_stage_moves_it_the_wrong_way(tmp_path):
+def test_a_move_the_wrong_way_ends_the_run_without_opening_the_shutters(tmp_path):
     dev = rig()
     x0 = dev.stage.get_position()[0]
     said = []
     s = Session(dev, tmp_path / "a", eye_state=EyeOnStage(dev, 0.5, 0.0, wrong=True), say=said.append)
-    c = s.auto_test(settings(center_first=True, target_r_mm=0.0), threading.Event())
-    assert c["cycles"] == 0 and said == ["centering is not converging"]
+    locs = ((0.0, 0.0), (0.0, 0.0))
+    c = s.auto_test(settings(center_first=True, locations=locs), threading.Event())
+    assert c["cycles"] == 0 and said == ["No planes. centering moved the wrong way, stopping"]
     assert abs(dev.stage.get_position()[0] - x0) <= 501.0   # one move, not a runaway
     assert not (tmp_path / "a" / "slews.csv").exists()
 
@@ -327,12 +366,12 @@ def test_an_outer_location_can_come_first(tmp_path):
     assert c["ended"] == "done" and c["n_failed"] == 0
 
 
-def test_a_badly_placed_head_is_still_refused_at_the_first_location(tmp_path):
+def test_a_second_click_can_start_far_from_where_the_first_ended(tmp_path):
     dev = rig()
-    before = dev.stage.get_position()
-    s = Session(dev, tmp_path / "a", eye_state=EyeOnStage(dev, 2.0, 0.0))
-    c = s.auto_test(settings(center_first=True, target_r_mm=0.0), threading.Event())
-    assert "too far" in c["ended"] and dev.stage.get_position() == before
+    s = Session(dev, tmp_path / "a", eye_state=EyeOnStage(dev, 0.0, 0.0))
+    for phi in (90.0, 270.0):
+        c = s.auto_test(settings(center_first=True, locations=((2.0, phi),), n_cycles=1), threading.Event())
+        assert c["n_off_target"] == 0 and c["found"] == 2
 
 
 def test_search_starts_in_front_of_the_tracker_plane(tmp_path):
@@ -361,17 +400,17 @@ def test_unbelievable_depth_is_ignored_and_never_passes_the_limit(tmp_path):
     assert float(rows(tmp_path / "a")[0]["start_um"]) == pytest.approx(PLANE - 500.0, abs=3.0) and c["found"] == 2
 
 
-def test_a_failed_location_is_skipped_and_two_without_a_pupil_end_the_run(tmp_path):
+def test_a_failed_location_is_skipped_and_two_without_pupil_or_plane_end_the_run(tmp_path):
     dev = rig(peak=0.0)
     said = []
     s = Session(dev, tmp_path / "a", eye_state=EyeOnStage(dev, 0.0, 0.0), say=said.append)
     locs = ((0.0, 0.0), (0.1, 0.0))
     c = s.auto_test(settings(center_first=True, locations=locs, search_um=800.0), threading.Event())
     assert c["n_failed"] == 2 and len(locations_csv(tmp_path / "a")) == 2 and "no plane" in said[0]
-    dev = rig()
-    s = Session(dev, tmp_path / "b", eye_state=lambda: dict(eye_x_mm=None, eye_y_mm=None, eye_age_s=0.0))
+    dev = rig(peak=0.0)
+    s = Session(dev, tmp_path / "b", eye_state=FixedEye(**NO_READING))
     locs = ((0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (1.0, 90.0))
-    c = s.auto_test(settings(center_first=True, locations=locs), threading.Event())
+    c = s.auto_test(settings(center_first=True, locations=locs, search_um=800.0), threading.Event())
     assert c["ended"] == "no pupil found" and len(locations_csv(tmp_path / "b")) == 2
 
 

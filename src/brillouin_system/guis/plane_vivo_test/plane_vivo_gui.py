@@ -110,6 +110,7 @@ class Worker(QObject):
     def jog_stage(self, dx: float, dy: float):
         def go():
             self.session.plane_um = None    # another spot on the cornea: the old plane must not aim a round trip
+            self.session.last_target = (0.0, 0.0)
             self.dev.stage.move_rel(dx=dx, dy=dy)
         self._guarded(go)
 
@@ -146,7 +147,7 @@ class Worker(QObject):
             c = self.session.auto_test(st, self.stop)
             self.test_result.emit(f"Last test ({c['ended']}): {c['n_ran']}/{c['n_locations']} "
                                   f"locations, {c['cycles']} round trips, {c['found']} found, "
-                                  f"{c['rejected']} rejected, {c['missed']} missed")
+                                  f"{c['rejected']} rejected, {c['missed']} missed, {c['n_off_target']} off target")
         self._guarded(go)
 
     @pyqtSlot()
@@ -192,6 +193,7 @@ class PlaneVivoWindow(QWidget):
         self._t0: Optional[float] = None
         self._eye = None
         self._eye_t = 0.0
+        self._eye_n = 0
         self._save_root = save_dir or DEFAULT_SAVE_DIR
         self._run_dir = self._save_root / f"vivo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self._build_ui(subject)
@@ -261,6 +263,7 @@ class PlaneVivoWindow(QWidget):
 
     def _on_eye_frames(self, left, right, meta):
         self._eye_frame_t = time.monotonic()
+        self._eye_n += 1
         self.eye_label.setStyleSheet("font-family: monospace;")
         self.eye_left.setImage(left, autoLevels=True)
         self.eye_right.setImage(right, autoLevels=True)
@@ -273,7 +276,7 @@ class PlaneVivoWindow(QWidget):
         if res.laser_position is None:
             self._eye = None
             self._worker.eye_state = dict(eye_x_mm=None, eye_y_mm=None, eye_dc_mm=None, eye_plane_um=None,
-                                          eye_lens_um=self._lens, eye_t=now)
+                                          eye_lens_um=self._lens, eye_t=now, eye_n=self._eye_n)
             self.eye_label.setText("Pupil not found")
             return
         self._eye, self._eye_t = res, now
@@ -282,7 +285,7 @@ class PlaneVivoWindow(QWidget):
         # _lens is only refreshed between actions; the cornea in lens z is right whichever lens z went into dc
         self._worker.eye_state = dict(eye_x_mm=float(x), eye_y_mm=float(y), eye_dc_mm=None if dc is None else float(dc),
                                       eye_plane_um=None if dc is None else self._lens + 1000.0 * float(dc),
-                                      eye_lens_um=self._lens, eye_t=now)
+                                      eye_lens_um=self._lens, eye_t=now, eye_n=self._eye_n)
         dc_text = "—" if dc is None else f"{dc:+.3f}"
         self.eye_label.setText(f"Laser at x {x:+.3f}, y {y:+.3f} mm from pupil center "
                                f"(R {np.hypot(x, y):.2f} mm)   Δc {dc_text} mm")
@@ -430,8 +433,9 @@ class PlaneVivoWindow(QWidget):
         f.addRow("Countdown:", self.settle)
         self.center_first = QCheckBox("Center XYZ at every location with the eye tracker")
         self.center_first.setChecked(True)
-        self.center_first.setToolTip("XY re-reads the pupil after every move. If it cannot center, that location is "
-                                     "skipped with the shutters closed. Z only chooses where the search starts.")
+        self.center_first.setToolTip("XY re-reads the pupil after every move. If it cannot center it still tests the "
+                                     "plane from where it is, and notes that. Only a move that clearly makes it worse "
+                                     "ends the run. Z only chooses where the search starts.")
         self.locations = QLineEdit(DEFAULT_LOCATIONS)
         self.locations.setToolTip("R mm, phi deg; separated by semicolons. Each click runs all of them in a new random "
                                   "order, with the round trips above at each.")
