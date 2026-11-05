@@ -108,6 +108,22 @@ class AxialScanningConfigDialog(QDialog):
         le_min_above.setValidator(QIntValidator(1, 1_000_000))
         self._add_row(v, "Min samples above threshold", "min_samples_above", le_min_above)
 
+        for label, key in (("Homodyne sample rate [Hz/ch]", "homodyne_sample_rate_hz"),
+                           ("Homodyne speed [µm/s]", "homodyne_speed_um_s"),
+                           ("Homodyne max distance [µm]", "homodyne_max_distance_um"),
+                           ("Homodyne threshold [nσ]", "homodyne_n_sigma"),
+                           ("Homodyne stop after [µm]", "homodyne_stop_after_um"),
+                           ("Homodyne band low [Hz]", "homodyne_band_lo_hz"),
+                           ("Homodyne band high [Hz]", "homodyne_band_hi_hz"),
+                           ("Homodyne RMS window [s]", "homodyne_rms_window_s")):
+            le = QLineEdit()
+            le.setValidator(QDoubleValidator(0.0, 1e12, 6))
+            self._add_row(v, label, key, le)
+
+        le_homodyne_chunk = QLineEdit()
+        le_homodyne_chunk.setValidator(QIntValidator(1, 1_000_000))
+        self._add_row(v, "Homodyne chunk size", "homodyne_chunk_size", le_homodyne_chunk)
+
         g.setLayout(v)
         return g
 
@@ -157,6 +173,15 @@ class AxialScanningConfigDialog(QDialog):
             idle_sleep_s=float(_req("idle_sleep_s")),
             z_offset_um=float(_req("z_offset_um")),
             min_samples_above=max(1, int(_req("min_samples_above"))),
+            homodyne_sample_rate_hz=float(_req("homodyne_sample_rate_hz")),
+            homodyne_speed_um_s=float(_req("homodyne_speed_um_s")),
+            homodyne_max_distance_um=float(_req("homodyne_max_distance_um")),
+            homodyne_n_sigma=float(_req("homodyne_n_sigma")),
+            homodyne_stop_after_um=float(_req("homodyne_stop_after_um")),
+            homodyne_band_lo_hz=float(_req("homodyne_band_lo_hz")),
+            homodyne_band_hi_hz=float(_req("homodyne_band_hi_hz")),
+            homodyne_rms_window_s=float(_req("homodyne_rms_window_s")),
+            homodyne_chunk_size=max(1, int(_req("homodyne_chunk_size"))),
         )
 
     # ------------------------------------------------------------------ #

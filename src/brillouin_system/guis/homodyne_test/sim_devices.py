@@ -30,7 +30,8 @@ class SimHomodyneDAQ:
         self,
         zaber,
         *,
-        plane_um: float,
+        plane_um: float = 0.0,
+        cornea=None,
         wavelength_nm: float = 780.24,
         lo_dc_v: tuple[float, float] = (0.80, 0.65),
         peak_amplitude_v: float = 0.05,
@@ -40,6 +41,7 @@ class SimHomodyneDAQ:
     ):
         self.zaber = zaber
         self.plane_um = float(plane_um)
+        self.cornea = cornea              # moving plane (z_at_array); overrides plane_um
         self.wavelength_um = float(wavelength_nm) * 1e-3
         self.lo_dc_v = tuple(float(x) for x in lo_dc_v)
         self.peak_amplitude_v = float(peak_amplitude_v)
@@ -76,7 +78,7 @@ class SimHomodyneDAQ:
         n_ch = len(self.channels)
         z = self.zaber.z_at_array(t_perf)
         z = z + 0.03 * np.sin(2 * math.pi * 37.0 * t_perf)          # micro-vibration
-        dz = z - self.plane_um
+        dz = z - (self.plane_um if self.cornea is None else self.cornea.z_at_array(t_perf))
         env = self.peak_amplitude_v * np.exp(-dz ** 2 / (4.0 * self.peak_sigma_um ** 2))
         theta = 0.6 + 0.5 * np.sin(2 * math.pi * t_perf / 25.0)      # signal polarization angle
         split = (np.cos(theta), np.sin(theta))
@@ -98,6 +100,7 @@ class SimHomodyneDAQ:
         duration_s: float,
         *,
         on_chunk: Optional[Callable[[int], None]] = None,
+        on_data: Optional[Callable[[np.ndarray], None]] = None,
         stop_evt: Optional[threading.Event] = None,
         chunk_size: int = 500,
         **_,
@@ -126,5 +129,7 @@ class SimHomodyneDAQ:
             n += want
             if on_chunk is not None:
                 on_chunk(n)
+            if on_data is not None:
+                on_data(buf[:, n - want:n].copy())
         return NIMultiReadResult(values=buf[:, :n].copy(), sample_rate_hz=fs,
                                  t0_perf=t0, channels=self.channels)

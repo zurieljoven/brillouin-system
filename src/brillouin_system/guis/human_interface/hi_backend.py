@@ -19,7 +19,8 @@ from brillouin_system.devices.zaber_engines.zaber_human_interface.zaber_human_in
 from brillouin_system.eye_tracker.calibrate_camera_laser_position.calib_rig_laser_position import LaserOffset, \
     CalibRigLaserPosition
 
-from brillouin_system.scan_managers.ni_reflection_finder4 import ReflectionResult, find_reflection_realtime
+from brillouin_system.scan_managers.homodyne_plane_finder import HomodyneFinderParams, find_reflection_homodyne
+from brillouin_system.scan_managers.ni_reflection_finder4 import ReflectionResult
 from brillouin_system.scan_managers.scanning_config.scanning_config import ScanningConfig, \
     axial_scanning_config
 from brillouin_system.scan_managers.sweep_scan_config.sweep_scan_config import SweepScanConfig, \
@@ -94,6 +95,9 @@ class HiBackend:
             sim_cornea = SimulatedCornea()
             zaber_eye_lens = SimZaberLens(start_um=9000.0)
             ni = SimNI(zaber_eye_lens, sim_cornea)
+            from brillouin_system.guis.homodyne_test.sim_devices import SimHomodyneDAQ
+            homodyne_daq = SimHomodyneDAQ(zaber_eye_lens, cornea=sim_cornea,
+                                          peak_amplitude_v=0.2, noise_std_v=0.006)
             zaber_hi=ZaberHumanInterfaceDummy()
             # Ground-truth cornea shared with the reflection finder, so the
             # eye-tracker Δc can be made consistent with it in dummy mode
@@ -127,6 +131,8 @@ class HiBackend:
             zaber_hi=ZaberHumanInterface()
             from brillouin_system.devices.ni.ni6008 import NI6008
             ni = NI6008()
+            from brillouin_system.devices.ni.ni6008_multi import NI6008Multi
+            homodyne_daq = NI6008Multi()    # ai0, ai1, RSE
 
         self.andor_camera: BaseCamera | DummyCamera | IxonUltra = camera
         self._andor_config: AndorConfig = andor_frame_config.get()
@@ -146,6 +152,7 @@ class HiBackend:
 
         # DAQ
         self.ni = ni
+        self.homodyne_daq = homodyne_daq
 
         # State
         self.is_shutter_open: bool = True
@@ -729,37 +736,33 @@ class HiBackend:
             log.info("System is in Reference (Calibration Mode) - Change to Sample Mode")
             return ReflectionResult(found=False)
 
-        ni_sample_rate_hz = self.axial_scan_config.ni_sample_rate_hz
-        if is_go_forwards:
-            speed_um_s = self.axial_scan_config.speed_um_s
-        else:
-            speed_um_s = -self.axial_scan_config.speed_um_s
-        max_distance_um = self.axial_scan_config.max_distance_um
-        threshold_high_n_sigma = self.axial_scan_config.threshold_high_n_sigma
-        threshold_low_n_sigma = self.axial_scan_config.threshold_low_n_sigma
-        bg_acqui_s = self.axial_scan_config.bg_acqui_s
-        debounce_s = self.axial_scan_config.debounce_s
-        z_poll_s = self.axial_scan_config.z_poll_s
-        chunk_size = self.axial_scan_config.chunk_size
-        idle_sleep_s = self.axial_scan_config.idle_sleep_s
-        offset_z_um = self.axial_scan_config.z_offset_um
-        min_samples_above = self.axial_scan_config.min_samples_above
-        result: ReflectionResult = find_reflection_realtime(
-            ni=self.ni,
-            zaber=self.zaber_eye_lens,
-            ni_sample_rate_hz=ni_sample_rate_hz,
-            speed_um_s=speed_um_s,
-            max_distance_um=max_distance_um,
-            threshold_high_n_sigma=threshold_high_n_sigma,
-            threshold_low_n_sigma=threshold_low_n_sigma,
-            bg_acqui_s=bg_acqui_s,
-            debounce_s=debounce_s,
-            z_poll_s=z_poll_s,
-            chunk_size=chunk_size,
-            idle_sleep_s=idle_sleep_s,
-            z_offset_um=offset_z_um,
-            min_samples_above=min_samples_above,
+        cfg = self.axial_scan_config
+        self.homodyne_daq.configure(sample_rate_hz=cfg.homodyne_sample_rate_hz)
+        params = HomodyneFinderParams(
+            speed_um_s=cfg.homodyne_speed_um_s,
+            max_distance_um=cfg.homodyne_max_distance_um,
+            band_hz=(cfg.homodyne_band_lo_hz, cfg.homodyne_band_hi_hz),
+            rms_window_s=cfg.homodyne_rms_window_s,
+            n_sigma=cfg.homodyne_n_sigma,
+            stop_after_um=cfg.homodyne_stop_after_um,
         )
+        try:
+            result = find_reflection_homodyne(
+                self.homodyne_daq,
+                self.zaber_eye_lens,
+                params,
+                direction=1.0 if is_go_forwards else -1.0,
+                z_offset_um=cfg.z_offset_um,
+                z_poll_s=cfg.z_poll_s,
+                chunk_size=cfg.homodyne_chunk_size,
+            )
+        except Exception:
+            log.exception("[Reflection finder] Search failed.")
+            return ReflectionResult(found=False)
+        if result.found:
+            log.info(f"[Reflection finder] Plane at z = {result.event_z_um:.1f} um, S peak {result.peak_value:.3f}")
+        else:
+            log.warning("[Reflection finder] Plane NOT found.")
         return result
 
 
@@ -781,6 +784,7 @@ class HiBackend:
             zaber_hi=self.zaber_hi,
             cancel_callback=self.f2b_cancel_callback,
             axial_scan_config=self.axial_scan_config,
+            find_plane=self.find_reflection_plane,
         )
 
         try:

@@ -159,8 +159,8 @@ def _accept_crossing(
     if reference_peak and result.peak_value is not None:
         frac = result.peak_value / reference_peak
         if frac < min_peak_fraction:
-            return False, (f"peak {result.peak_value:.3f} V is {frac:.2f}× the "
-                           f"{reference_name} peak {reference_peak:.3f} V "
+            return False, (f"peak {result.peak_value:.3f} is {frac:.2f}× the "
+                           f"{reference_name} peak {reference_peak:.3f} "
                            f"(min {min_peak_fraction:.2f}×)")
 
     return True, None
@@ -208,8 +208,8 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
     # time - the clock begins only once the sweep itself starts.
     max_time_s = getattr(sw, "max_time_s", 0.0) or 0.0
     t_start = time.monotonic()
-    _speed = abs(getattr(backend.axial_scan_config, "speed_um_s", 0.0)) or 1.0
-    t_find_worst = backend.axial_scan_config.max_distance_um / _speed
+    _speed = abs(getattr(backend.axial_scan_config, "homodyne_speed_um_s", 0.0)) or 1.0
+    t_find_worst = backend.axial_scan_config.homodyne_max_distance_um / _speed
     try:
         exposure_s = float(backend.sample_state_mode.andor_camera_info.exposure)
     except Exception:
@@ -252,8 +252,8 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
     # slow legitimate change in signal does not accumulate into a rejection.
     ref_peak = r0.peak_value
     log.info(f"[Sweep Scan] Plane at {plane_est:.1f} µm, reference peak "
-             f"{ref_peak:.3f} V (crossings must exceed "
-             f"{sw.min_peak_fraction * ref_peak:.3f} V).")
+             f"{ref_peak:.3f} (crossings must exceed "
+             f"{sw.min_peak_fraction * ref_peak:.3f}).")
 
     measurements: list[MeasurementPoint] = []
     cycles: list[SweepCycle] = []

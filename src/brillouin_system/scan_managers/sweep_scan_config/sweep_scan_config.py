@@ -46,8 +46,12 @@ class SweepScanConfig:
     # reference peak (initial find for in-crossings, same-cycle in-crossing for
     # out-crossings). Every false crossing seen on 2026-07-30 was a WEAK peak:
     # 0.12x the real one for the cuvette back wall, 0.006x for a finder outlier,
-    # while genuine crossings held above 0.8x. 0.3 separates them with margin.
-    min_peak_fraction: float = 0.3
+    # while genuine crossings held above 0.8x. Those are the old detector's numbers.
+    # With the homodyne S, genuine crossings vary more: 0.15x at worst, 2-9 % below
+    # 0.3x (320 slews, 2026-10-09 and 2026-11-02), so the gate moved to 0.15. The
+    # cuvette back face is 0.17-0.30x and now passes this gate; the distance gates
+    # still apply.
+    min_peak_fraction: float = 0.15
 
 
 SWEEP_SCAN_TOML_PATH = CONFIG_DIR / "sweep_scan_config.toml"

@@ -107,6 +107,7 @@ class NI6008Multi:
         duration_s: float,
         *,
         on_chunk: Optional[Callable[[int], None]] = None,
+        on_data: Optional[Callable[[np.ndarray], None]] = None,
         stop_evt: Optional[threading.Event] = None,
         chunk_size: int = 500,
         read_timeout_s: float = 1.0,
@@ -117,7 +118,9 @@ class NI6008Multi:
         on_chunk(n_acquired) is called (in this thread) after every block, so
         the caller can start motion once the pre-roll is recorded. It must
         not block for long; the DAQ buffer holds several seconds at most.
-        stop_evt ends the acquisition early; the samples so far are returned.
+        on_data(block) gets each new (n_ch, m) block in the same way, for
+        real-time processing. stop_evt ends the acquisition early; the samples
+        so far are returned.
         """
         self.validate()
 
@@ -170,6 +173,8 @@ class NI6008Multi:
                     n += want
                     if on_chunk is not None:
                         on_chunk(n)
+                    if on_data is not None:
+                        on_data(data)
             finally:
                 task.stop()
 

@@ -29,6 +29,20 @@ class ScanningConfig:
     idle_sleep_s: float = 0.001
     z_offset_um: float = 0.0
     min_samples_above: int = 3
+    # ----------------------------
+    # Homodyne finder (human interface GUI). z_offset_um above is shared. The
+    # defaults are from the replay on 320 slews (2026-10-09, 2026-11-02), all at
+    # 400 um/s: other speeds are untested until the phantom speed block is run.
+    # ----------------------------
+    homodyne_sample_rate_hz: float = 5000.0   # per channel
+    homodyne_speed_um_s: float = 400.0
+    homodyne_max_distance_um: float = 1500.0
+    homodyne_n_sigma: float = 20.0
+    homodyne_stop_after_um: float = 150.0
+    homodyne_band_lo_hz: float = 100.0
+    homodyne_band_hi_hz: float = 2400.0
+    homodyne_rms_window_s: float = 0.005
+    homodyne_chunk_size: int = 100
 
 
 AXIAL_SCANNING_TOML_PATH = CONFIG_DIR / "scanning_config.toml"
@@ -80,6 +94,15 @@ def _dataclass_to_toml_dict(cfg: ScanningConfig) -> dict[str, Any]:
         "idle_sleep_s": float(cfg.idle_sleep_s),
         "z_offset_um": float(cfg.z_offset_um),
         "min_samples_above": int(cfg.min_samples_above),
+        "homodyne_sample_rate_hz": float(cfg.homodyne_sample_rate_hz),
+        "homodyne_speed_um_s": float(cfg.homodyne_speed_um_s),
+        "homodyne_max_distance_um": float(cfg.homodyne_max_distance_um),
+        "homodyne_n_sigma": float(cfg.homodyne_n_sigma),
+        "homodyne_stop_after_um": float(cfg.homodyne_stop_after_um),
+        "homodyne_band_lo_hz": float(cfg.homodyne_band_lo_hz),
+        "homodyne_band_hi_hz": float(cfg.homodyne_band_hi_hz),
+        "homodyne_rms_window_s": float(cfg.homodyne_rms_window_s),
+        "homodyne_chunk_size": int(cfg.homodyne_chunk_size),
     }
 
 

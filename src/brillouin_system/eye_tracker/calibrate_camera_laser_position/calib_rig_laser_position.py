@@ -147,6 +147,7 @@ class CalibRigLaserPosition:
         zaber_hi,
         cancel_callback: Callable,
         axial_scan_config: ScanningConfig,
+        find_plane: Callable[[], ReflectionResult] | None = None,
     ):
         # Load scanning settings:
         settings = load_calibration_settings()
@@ -175,6 +176,7 @@ class CalibRigLaserPosition:
 
         # Assign
         self.ni = ni
+        self._find_plane = find_plane    # None: the legacy single-channel finder
         self.zaber_eye_lens: ZaberEyeLens = zaber_eye_lens
         self.cancel_callback = cancel_callback
 
@@ -215,6 +217,9 @@ class CalibRigLaserPosition:
 
         # Move the zaber lens back:
         self.zaber_eye_lens.move_abs(self._zaber_lens_search_position)
+
+        if self._find_plane is not None:
+            return self._find_plane()
 
         result: ReflectionResult = find_reflection_realtime(
             ni=self.ni,

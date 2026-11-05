@@ -194,3 +194,16 @@ def test_every_nested_dataclass_is_discovered_by_the_registry():
     }
     missing = required - set(known_classes)
     assert not missing, f"registry discovery lost: {sorted(missing)}"
+
+
+def test_two_channel_homodyne_reflection_result_roundtrips(tmp_path):
+    from dataclasses import replace
+
+    values = np.arange(12.0).reshape(2, 6)
+    scan = replace(make_full_scan(), reflection_result_forwards=replace(
+        make_reflection_result(0.0), daq_values=values, threshold_low=None))
+    path = str(tmp_path / "scan.h5")
+    save_dict_to_hdf5(path, dataclass_to_hdf5_native_dict(scan))
+    loaded = dict_to_dataclass_tree(load_dict_from_hdf5(path), known_classes)
+    assert np.array_equal(loaded.reflection_result_forwards.daq_values, values)
+    assert loaded.reflection_result_forwards.threshold_low is None
