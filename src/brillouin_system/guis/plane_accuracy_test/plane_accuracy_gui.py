@@ -303,6 +303,14 @@ class PlaneAccuracyWindow(QWidget):
             b.clicked.connect(lambda _, x=d: self._find(x))
             row.addWidget(b)
         f.addRow(row)
+        self.exposure = _dspin(0.001, 60.0, 0.2, 0.05, 3, " s")
+        self.exposure.setToolTip("Used by Snap, Live (from the next frame), Andor scan and the run.")
+        self.gain = QSpinBox()
+        self.gain.setRange(0, 1000)
+        self.exposure.valueChanged.connect(self._update_info)
+        self.gain.valueChanged.connect(self._update_info)
+        f.addRow("Andor exposure:", self.exposure)
+        f.addRow("Andor gain:", self.gain)
         row = QHBoxLayout()
         self.snap_btn = QPushButton("Snap Andor")
         self.snap_btn.clicked.connect(self._snap)
@@ -361,9 +369,6 @@ class PlaneAccuracyWindow(QWidget):
         self.ax_before = _dspin(10.0, 1000.0, 150.0, 10.0, 0, " um")
         self.ax_after = _dspin(10.0, 1000.0, 200.0, 10.0, 0, " um")
         self.ax_step = _dspin(1.0, 200.0, 10.0, 5.0, 1, " um")
-        self.exposure = _dspin(0.001, 60.0, 0.2, 0.05, 3, " s")
-        self.gain = QSpinBox()
-        self.gain.setRange(0, 1000)
         self.close_end = QCheckBox("Close shutters at the end")
         self.close_end.setChecked(True)
         self.save_dir = QLineEdit(str(save_dir))
@@ -373,7 +378,7 @@ class PlaneAccuracyWindow(QWidget):
                          ("Find from plane ±:", self.half), ("Finder speed:", self.speed),
                          ("Finder threshold:", self.n_sigma), ("Finder stop after:", self.stop_after),
                          ("Axial before plane:", self.ax_before), ("Axial after plane:", self.ax_after),
-                         ("Axial step:", self.ax_step), ("Andor exposure:", self.exposure), ("Andor gain:", self.gain)):
+                         ("Axial step:", self.ax_step)):
             f.addRow(label, w)
             w.valueChanged.connect(self._update_info)
         f.addRow(self.close_end)
