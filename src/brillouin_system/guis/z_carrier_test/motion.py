@@ -126,6 +126,12 @@ class ZaberAxisMover(AxisMover):
     def __init__(self, name: str, axis):
         super().__init__(name)
         self.axis = axis
+        self._restore = None        # puts maxspeed back after a slew on older firmware
+
+    def restore_speed(self) -> None:
+        if self._restore is not None:
+            self._restore()
+            self._restore = None
 
     def _get(self) -> float:
         from zaber_motion import Units
@@ -133,18 +139,22 @@ class ZaberAxisMover(AxisMover):
 
     def _move_abs(self, z_um: float) -> None:
         from zaber_motion import Units
+        self.axis.wait_until_idle()
+        self.restore_speed()
         self.axis.move_absolute(z_um, Units.LENGTH_MICROMETRES)
 
     def _slew_to(self, z_um: float, speed_um_s: float) -> None:
-        from zaber_motion import Units
-        self.axis.move_absolute(z_um, Units.LENGTH_MICROMETRES, wait_until_idle=False, velocity=speed_um_s,
-                                velocity_unit=Units.VELOCITY_MICROMETRES_PER_SECOND)
+        from brillouin_system.devices.zaber_engines.zaber_human_interface.zaber_slew import move_abs_at_speed
+        self.restore_speed()
+        self._restore = move_abs_at_speed(self.axis, z_um, speed_um_s)
 
     def _wait_idle(self, timeout_s: float) -> None:
         self.axis.wait_until_idle()
+        self.restore_speed()
 
     def stop(self) -> None:
-        self.axis.stop()
+        self.axis.stop()        # waits until idle
+        self.restore_speed()
 
 
 class SimAxisMover(AxisMover):

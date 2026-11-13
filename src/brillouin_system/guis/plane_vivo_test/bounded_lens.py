@@ -19,6 +19,7 @@ class BoundedLens:
     def __init__(self, lens):
         self._lens = lens
         self.ceiling_um: Optional[float] = None
+        self._restore = None
 
     def __getattr__(self, name):
         return getattr(self._lens, name)    # get_position, the position log, stop_slewing, close
@@ -35,6 +36,7 @@ class BoundedLens:
 
     def move_abs(self, position_um: float) -> None:
         self._check(float(position_um))
+        self._restore_speed()
         self._lens.move_abs(float(position_um))
 
     def move_rel(self, delta_um: float) -> None:
@@ -57,7 +59,18 @@ class BoundedLens:
         if axis is None:    # simulated lens
             self._lens.start_slewing_guarded(speed_um_per_s, distance)
             return
-        from zaber_motion import Units
-        axis.move_absolute(float(self._lens.get_position()) + direction * distance, Units.LENGTH_MICROMETRES,
-                           wait_until_idle=False, velocity=abs(float(speed_um_per_s)),
-                           velocity_unit=Units.VELOCITY_MICROMETRES_PER_SECOND)
+        from brillouin_system.devices.zaber_engines.zaber_human_interface.zaber_slew import move_abs_at_speed
+        self._restore_speed()
+        self._restore = move_abs_at_speed(axis, float(self._lens.get_position()) + direction * distance,
+                                          speed_um_per_s)
+
+    def _restore_speed(self) -> None:
+        """Older firmware: the slew lowered maxspeed; put it back (only once the axis has stopped)."""
+        restore = getattr(self, "_restore", None)
+        if restore is not None:
+            restore()
+            self._restore = None
+
+    def stop_slewing(self) -> None:
+        self._lens.stop_slewing()       # stops and waits until idle
+        self._restore_speed()

@@ -198,6 +198,12 @@ class Worker(QObject):
     def shutdown(self):
         if self.rig is None:
             return
+        for m in (self.rig.lens, self.rig.stage):
+            try:
+                if hasattr(m, "restore_speed"):
+                    m.restore_speed()
+            except Exception:
+                pass
         try:
             self.rig.shutters.close_all()
         except Exception:
