@@ -19,7 +19,7 @@ import csv
 import json
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -30,7 +30,7 @@ from brillouin_system.guis.plane_accuracy_test.axial_recording import AxialRecor
 from brillouin_system.guis.plane_accuracy_test.runner import open_sample_path
 from brillouin_system.guis.z_carrier_test.motion import AxisMover
 from brillouin_system.guis.z_carrier_test.protocol import (
-    POST_ROLL_S, PRE_ROLL_S, PRELOAD_UM, ProtocolConfig, Step,
+    POST_ROLL_S, PRE_ROLL_S, PRELOAD_UM, ProtocolConfig, Step, alias_hz, channels_for,
 )
 from brillouin_system.scan_managers.homodyne_plane_finder import HomodyneFinderParams, refine_plane
 from brillouin_system.scan_managers.homodyne_recording import HomodyneRecording, save_recording
@@ -39,7 +39,10 @@ SETTLE_S = 0.2
 FRAME_SETTLE_S = 0.05
 DC_WARN_V = 8.5
 ANDOR_SATURATION = 65000    # 16-bit counts
-LOG_FIELDS = ["step", "block", "kind", "axis", "direction", "speed_um_s", "file", "status", "time", "t_perf",
+STAGE_XY_PRELOAD_UM = 50.0  # every location is approached in X/Y from the same side
+MAX_XY_FROM_CENTER_UM = 6000.0
+MAX_STAGE_Z_DIFF_UM = 200.0
+LOG_FIELDS = ["step", "block", "kind", "axis", "direction", "speed_um_s", "fs_hz", "file", "status", "time", "t_perf",
               "lens_um", "stage_um", "dc_v", "peak_pos_um", "peak_rel_um", "peak_value"]
 
 
@@ -52,7 +55,22 @@ class Rig:
     shutters: object = None
     jog_lens: Callable[[float], None] = None     # manual moves, outside the run window (driver move_rel)
     jog_stage: Callable[[float], None] = None
+    xy_get: Callable[[], tuple] = None           # stage (x, y) [um]
+    xy_move: Callable[[float, float], None] = None   # absolute stage X/Y [um], blocking; stage Z untouched
     devices: tuple = ()             # driver objects to close at shutdown
+
+
+@dataclass(frozen=True)
+class Location:
+    """A point on the sample set by hand with the lens on the plane there."""
+    name: str               # "center", "p1", ..., "edge"
+    stage_x_um: float
+    stage_y_um: float
+    stage_z_um: float
+    lens_um: float
+
+    def r_mm(self, center: "Location") -> float:
+        return float(np.hypot(self.stage_x_um - center.stage_x_um, self.stage_y_um - center.stage_y_um)) / 1000.0
 
 
 class Cancelled(Exception):
@@ -65,12 +83,20 @@ def approach(mover: AxisMover, z_um: float) -> None:
     mover.move_abs(z_um)
 
 
+def finder_params(fs: float, speed_um_s: float = 400.0) -> HomodyneFinderParams:
+    """The live finder's S settings for analysis: band from 100 Hz up to 0.95 x Nyquist (2400 Hz at 5 kS/s, the
+    live finder's band), and an RMS window of at most 5 ms that spans 2 um of travel (5 ms at 400 um/s)."""
+    p = HomodyneFinderParams(speed_um_s=speed_um_s)
+    return replace(p, band_hz=(p.band_hz[0], 0.95 * 0.5 * float(fs)),
+                   rms_window_s=min(p.rms_window_s, 2.0 / max(float(speed_um_s), 1.0)))
+
+
 def s_peak(rec: HomodyneRecording, speed_um_s: float) -> tuple[Optional[float], float]:
     """Moving-axis position of the S^2-weighted plane (live-finder band and window), and the S maximum."""
     z = rec.z_um()
     if z is None:
         return None, float("nan")
-    p = HomodyneFinderParams(speed_um_s=speed_um_s)
+    p = finder_params(rec.sample_rate_hz, speed_um_s)
     rp = refine_plane(rec.values, rec.sample_rate_hz, p, i_min=int((PRE_ROLL_S + 0.1) * rec.sample_rate_hz))
     return float(np.interp(rp.index, np.arange(z.size), z)), rp.s_peak
 
@@ -167,6 +193,103 @@ def park_lens_on_plane(rig: Rig, half_um: float, speed_um_s: float, stop: thread
     return z_plane, rec
 
 
+def go_to_location(rig: Rig, loc: Location, lens_back_um: float) -> None:
+    """Lens back first (a deep lens z at the edge is inside the sample at the center), stage X/Y from a fixed side,
+    stage Z to the point's z, then the lens onto the point's plane from below."""
+    z_now = rig.lens.get_position()
+    z_safe = min(z_now, loc.lens_um - lens_back_um)
+    rig.lens.set_window(min(z_safe, loc.lens_um) - PRELOAD_UM - 5.0, max(z_now, loc.lens_um) + 5.0)
+    rig.lens.move_abs(z_safe)
+    rig.xy_move(loc.stage_x_um - STAGE_XY_PRELOAD_UM, loc.stage_y_um - STAGE_XY_PRELOAD_UM)
+    rig.xy_move(loc.stage_x_um, loc.stage_y_um)
+    time.sleep(SETTLE_S)
+    sz = rig.stage.get_position()
+    if abs(sz - loc.stage_z_um) > 1.0:
+        rig.stage.set_window(min(sz, loc.stage_z_um) - PRELOAD_UM - 5.0, max(sz, loc.stage_z_um) + 5.0)
+        approach(rig.stage, loc.stage_z_um)
+    approach(rig.lens, loc.lens_um)
+
+
+def check_locations(locations: list[Location]) -> None:
+    if not locations:
+        raise ValueError("No locations set")
+    names = [l.name for l in locations]
+    if len(set(names)) != len(names):
+        raise ValueError("Location names must be unique")
+    c = locations[0]
+    for l in locations[1:]:
+        if 1000.0 * l.r_mm(c) + STAGE_XY_PRELOAD_UM > MAX_XY_FROM_CENTER_UM:
+            raise ValueError(f"{l.name} is {l.r_mm(c):.2f} mm from {c.name}, above the "
+                             f"{MAX_XY_FROM_CENTER_UM / 1000:.1f} mm limit")
+        if abs(l.stage_z_um - c.stage_z_um) > MAX_STAGE_Z_DIFF_UM:
+            raise ValueError(f"{l.name}: stage Z differs from {c.name} by {l.stage_z_um - c.stage_z_um:+.0f} um "
+                             f"(limit {MAX_STAGE_Z_DIFF_UM:.0f})")
+
+
+def run_locations(rig: Rig, cfg: ProtocolConfig, locations: list[Location], run_dir: Path, stop: threading.Event, *,
+                  recentre: bool = True,
+                  on_status: Callable[[str], None] = lambda s: None,
+                  on_result: Callable[[dict, object], None] = lambda row, rec: None,
+                  on_frame: Optional[Callable[[np.ndarray, float], None]] = None) -> dict:
+    """The protocol at every location in order, each into run_dir/L<i>_<name>/. With recentre, a lens Andor sweep
+    (saved as L<i>_<name>_recentre.h5) moves the lens to the Andor peak first, since the sample drifts.
+    Afterwards the lens backs off and the stage returns to the first location."""
+    cfg.validate()
+    check_locations(locations)
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=False)
+    c = locations[0]
+    with open(run_dir / "locations.json", "w") as fh:
+        json.dump(dict(cfg.as_dict(), recentre=recentre, created=datetime.now().isoformat(timespec="seconds"),
+                       locations=[dict(asdict(l), r_mm=l.r_mm(c)) for l in locations]), fh, indent=2, default=float)
+    sub_cfg = replace(cfg, close_shutters_at_end=False)
+    back = cfg.slew_half_um + 100.0
+    total = dict(n_done=0, n_slew=0, n_andor=0, n_stationary=0, n_locations=0)
+    try:
+        for i, loc in enumerate(locations):
+            if stop.is_set():
+                break
+            tag = f"L{i}_{loc.name}"
+            on_status(f"Location {i + 1}/{len(locations)}: {loc.name}, R = {loc.r_mm(c):.2f} mm. Moving there ...")
+            go_to_location(rig, loc, back)
+            if recentre:
+                rig.camera.set_exposure_time(cfg.exposure_s)
+                rig.camera.set_emccd_gain(cfg.gain)
+                w = cfg.andor_half_um + PRELOAD_UM + 5.0
+                rig.lens.set_window(loc.lens_um - w, loc.lens_um + w)
+                try:
+                    rec = andor_sweep(rig, rig.lens, loc.lens_um, cfg.andor_half_um, cfg.andor_step_um,
+                                      dict(axis="lens", location=loc.name, kind="recentre"), stop, on_frame)
+                except Cancelled:
+                    break
+                save_axial(rec, run_dir / f"{tag}_recentre.h5")
+                z = andor_peak(rec)
+                if abs(z - loc.lens_um) < cfg.andor_half_um - cfg.andor_step_um:
+                    approach(rig.lens, z)
+                    on_status(f"  re-centred: Andor peak {z - loc.lens_um:+.1f} um from the set plane")
+                else:
+                    on_status(f"  WARNING: Andor peak at the sweep edge ({z - loc.lens_um:+.1f} um); kept the set plane")
+                on_result(None, rec)
+            counts = run_protocol(rig, sub_cfg, run_dir / tag, stop, on_status=on_status, on_result=on_result,
+                                  on_frame=on_frame)
+            for k, v in counts.items():
+                total[k] += v
+            total["n_locations"] += 1
+    finally:
+        try:
+            z_now = rig.lens.get_position()
+            z_safe = min(z_now, c.lens_um - back)
+            rig.lens.set_window(z_safe - PRELOAD_UM - 5.0, max(z_now, c.lens_um) + 5.0)
+            rig.lens.move_abs(z_safe)
+            rig.xy_move(c.stage_x_um - STAGE_XY_PRELOAD_UM, c.stage_y_um - STAGE_XY_PRELOAD_UM)
+            rig.xy_move(c.stage_x_um, c.stage_y_um)
+            approach(rig.lens, c.lens_um)
+        finally:
+            if cfg.close_shutters_at_end and rig.shutters is not None:
+                rig.shutters.close_all()
+    return total
+
+
 def run_protocol(rig: Rig, cfg: ProtocolConfig, run_dir: Path, stop: threading.Event, *,
                  on_status: Callable[[str], None] = lambda s: None,
                  on_result: Callable[[dict, object], None] = lambda row, rec: None,
@@ -192,7 +315,6 @@ def run_protocol(rig: Rig, cfg: ProtocolConfig, run_dir: Path, stop: threading.E
     with open(log_path, "w", newline="") as fh:
         csv.DictWriter(fh, fieldnames=LOG_FIELDS).writeheader()
 
-    rig.daq.configure(sample_rate_hz=cfg.sample_rate_hz)
     rig.camera.set_exposure_time(cfg.exposure_s)
     rig.camera.set_emccd_gain(cfg.gain)
     if rig.shutters is not None:
@@ -205,11 +327,15 @@ def run_protocol(rig: Rig, cfg: ProtocolConfig, run_dir: Path, stop: threading.E
                 break
             label = s.kind if s.kind == "stationary" else f"{s.kind} {s.axis}" + (
                 f" {'fwd' if s.direction > 0 else 'bwd'} {s.speed_um_s:.0f} um/s" if s.kind == "slew" else "")
+            if s.kind != "andor":
+                label += f" at {s.fs_hz:.0f} S/s"
+                rig.daq.configure(sample_rate_hz=s.fs_hz, channels=channels_for(s.fs_hz))
             on_status(f"Step {s.index + 1}/{len(steps)} (block {s.block}): {label}")
             meta = dict(experiment=run_dir.name, sample=cfg.sample, step=s.index + 1, block=s.block, kind=s.kind,
-                        axis=s.axis, lens_start_um=lens0, stage_start_um=stage0)
+                        axis=s.axis, lens_start_um=lens0, stage_start_um=stage0, pd_gain_db=cfg.pd_gain_db,
+                        fp_mod_hz=cfg.fp_mod_hz, fs_hz=s.fs_hz, fp_alias_hz=alias_hz(cfg.fp_mod_hz, s.fs_hz) if s.fs_hz else None)
             row = dict(step=s.index + 1, block=s.block, kind=s.kind, axis=s.axis, direction=s.direction,
-                       speed_um_s=s.speed_um_s, t_perf=time.perf_counter(), status="ok",
+                       speed_um_s=s.speed_um_s, fs_hz=s.fs_hz, t_perf=time.perf_counter(), status="ok",
                        time=datetime.now().isoformat(timespec="seconds"),
                        lens_um=rig.lens.get_position(), stage_um=rig.stage.get_position())
             name = s.name() + ".h5"

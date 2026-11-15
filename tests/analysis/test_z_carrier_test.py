@@ -27,31 +27,57 @@ def rig(lens_start=PLANE):
 
 
 def small(**kw):
-    base = dict(n_blocks=1, stationary_s=0.3, slew_half_um=40.0, speeds_um_s=(400.0,), andor_half_um=4.0,
-                andor_step_um=2.0, exposure_s=0.01)
+    base = dict(n_blocks=1, stationary_s=0.3, slew_half_um=40.0, speeds_um_s=(400.0,), sample_rates_hz=(5000.0,),
+                andor_half_um=4.0, andor_step_um=2.0, exposure_s=0.01)
     base.update(kw)
     return ProtocolConfig(**base)
 
 
-def test_steps_every_slew_once_per_block_and_sweeps_at_both_ends():
-    cfg = ProtocolConfig(n_blocks=3, speeds_um_s=(200.0, 400.0), seed=7)
+def test_steps_every_cell_once_per_block_and_sweeps_at_both_ends():
+    cfg = ProtocolConfig(n_blocks=3, speeds_um_s=(200.0, 400.0, 800.0), sample_rates_hz=(5000.0, 4500.0, 4000.0),
+                         seed=7)
+    # the stage-Z fringe at 800 um/s (2051 Hz) is above 0.9 x Nyquist at 4500 and 4000 S/s
+    assert cfg.skipped() == [(800.0, 4500.0), (800.0, 4000.0)] and len(cfg.combos()) == 7
     steps = cfg.steps()
     assert [(s.kind, s.axis) for s in steps[:2]] == [("andor", "lens"), ("andor", "stage")]
     assert [(s.kind, s.axis) for s in steps[-2:]] == [("andor", "lens"), ("andor", "stage")]
     for b in (1, 2, 3):
         blk = [s for s in steps if s.block == b]
-        assert blk[0].kind == "stationary"
-        cells = Counter((s.axis, s.direction, s.speed_um_s) for s in blk[1:])
-        assert len(cells) == 8 and set(cells.values()) == {1}
+        assert sorted(s.fs_hz for s in blk if s.kind == "stationary") == [4000.0, 4500.0, 5000.0]
+        cells = Counter((s.axis, s.direction, s.speed_um_s, s.fs_hz) for s in blk if s.kind == "slew")
+        assert len(cells) == 28 and set(cells.values()) == {1}
     assert [s.index for s in steps] == list(range(len(steps)))
-    assert steps == ProtocolConfig(n_blocks=3, speeds_um_s=(200.0, 400.0), seed=7).steps()
+    assert steps == ProtocolConfig(n_blocks=3, speeds_um_s=(200.0, 400.0, 800.0),
+                                   sample_rates_hz=(5000.0, 4500.0, 4000.0), seed=7).steps()
     assert len({s.name() for s in steps}) == len(steps)
+
+
+def test_sweep_sets_the_daq_rate_for_every_record(tmp_path):
+    r = rig()
+    cfg = small(sample_rates_hz=(5000.0, 4000.0), fp_mod_hz=3400.0, pd_gain_db=60)
+    run_protocol(r, cfg, tmp_path / "run", threading.Event())
+    seen = set()
+    for s in cfg.steps():
+        if s.kind == "andor":
+            continue
+        rec = load_recording(tmp_path / "run" / (s.name() + ".h5"))
+        assert rec.sample_rate_hz == s.fs_hz
+        assert rec.meta["fp_mod_hz"] == 3400.0 and rec.meta["pd_gain_db"] == 60
+        assert rec.meta["fp_alias_hz"] == pytest.approx(1600.0 if s.fs_hz == 5000.0 else 600.0)
+        seen.add((s.kind, s.fs_hz))
+    assert seen == {("stationary", 5000.0), ("stationary", 4000.0), ("slew", 5000.0), ("slew", 4000.0)}
+    plan = json.load(open(tmp_path / "run" / "plan.json"))
+    assert plan["sample_rates_hz"] == [5000.0, 4000.0] and plan["fp_alias_hz"] == {"5000": 1600.0, "4000": 600.0}
 
 
 def test_validate_limits():
     ProtocolConfig().validate()
     with pytest.raises(ValueError):
-        ProtocolConfig(speeds_um_s=(1000.0,)).validate()       # stage-Z fringe above Nyquist at 5 kS/s
+        ProtocolConfig(speeds_um_s=(1000.0,), sample_rates_hz=(5000.0,)).validate()   # fringe above Nyquist
+    with pytest.raises(ValueError):
+        ProtocolConfig(sample_rates_hz=(12000.0,)).validate()  # USB-6008: 10 kS/s in total
+    with pytest.raises(ValueError):
+        ProtocolConfig(speeds_um_s=(1800.0,)).validate()       # too fast even at 10 kS/s on one channel
     with pytest.raises(ValueError):
         ProtocolConfig(slew_half_um=500.0).validate()
     with pytest.raises(ValueError):
@@ -127,3 +153,46 @@ def test_stop_ends_the_run_and_returns_axes(tmp_path):
     counts = run_protocol(r, small(), tmp_path / "run", stop, on_result=on_result)
     assert counts["n_done"] == 3
     assert abs(r.lens.get_position() - lens0) < 2.0 and abs(r.stage.get_position() - stage0) < 2.0
+
+
+def test_alias_positions_for_the_fp_test():
+    from brillouin_system.guis.z_carrier_test.protocol import alias_hz
+    assert alias_hz(3396.5, 5000.0) == pytest.approx(1603.5)
+    assert alias_hz(3396.5, 4500.0) == pytest.approx(1103.5)
+    assert alias_hz(3396.5, 4000.0) == pytest.approx(603.5)
+    assert alias_hz(1603.5, 4500.0) == pytest.approx(1603.5)     # a real tone below Nyquist stays put
+
+
+def test_stationary_at_another_sample_rate(tmp_path):
+    from brillouin_system.guis.z_carrier_test.runner import record_stationary
+    from brillouin_system.scan_managers.homodyne_recording import save_recording
+    r = rig()
+    r.daq.configure(sample_rate_hz=4500.0)
+    rec = record_stationary(r, 0.4, {"pd_gain_db": 60}, threading.Event())
+    save_recording(rec, tmp_path / "s.h5")
+    back = load_recording(tmp_path / "s.h5")
+    assert back.sample_rate_hz == 4500.0 and back.meta["pd_gain_db"] == 60
+    assert back.values.shape[-1] == pytest.approx(0.4 * 4500, abs=5)
+
+
+def test_default_sweep_pushes_to_the_daq_limit():
+    from brillouin_system.guis.z_carrier_test.protocol import channels_for, max_fringe_speed_um_s
+    cfg = ProtocolConfig()
+    cfg.validate()
+    assert channels_for(10000.0) == ("ai0",) and channels_for(5000.0) == ("ai0", "ai1")
+    assert max_fringe_speed_um_s(10000.0) == pytest.approx(1755.5, abs=1.0)
+    by_rate = {}
+    for v, fs in cfg.combos():
+        by_rate.setdefault(fs, []).append(v)
+    assert by_rate == {10000.0: [200.0, 400.0, 800.0, 1200.0, 1600.0], 5000.0: [200.0, 400.0, 800.0],
+                       4000.0: [200.0, 400.0]}
+
+
+def test_ten_khz_records_h_only(tmp_path):
+    r = rig()
+    cfg = small(sample_rates_hz=(10000.0,), speeds_um_s=(1600.0,))
+    run_protocol(r, cfg, tmp_path / "run", threading.Event())
+    for s in cfg.steps():
+        if s.kind != "andor":
+            rec = load_recording(tmp_path / "run" / (s.name() + ".h5"))
+            assert rec.sample_rate_hz == 10000.0 and rec.values.shape[0] == 1 and rec.channels == ("ai0",)

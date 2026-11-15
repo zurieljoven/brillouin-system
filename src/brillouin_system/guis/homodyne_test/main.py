@@ -13,6 +13,9 @@ stage so the laser lands at (R, phi) relative to the pupil; Move Z moves the
 eye lens to the target delta_c (this leaves the reflection plane; use a slew
 and "Move lens to last slew peak" to get back onto the surface).
 
+Slews run on the eye lens or the rig stage Z ("Slew axis"). The Andor tab connects the iXon only when
+you press "Connect Andor"; close the human interface and the other test GUIs first (one program per camera).
+
 Wiring (USB-6008 analog terminal block, RSE):
     PD H (PBS output 1): signal -> pin 2 (AI0), shield -> pin 1 (GND)
     PD V (PBS output 2): signal -> pin 5 (AI1), shield -> pin 4 (GND)

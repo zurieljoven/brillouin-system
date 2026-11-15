@@ -13,6 +13,13 @@ The Shutters group opens the sample (objective) shutter, since closing the
 main GUI closes all shutters; nothing is opened on startup and all shutters
 are closed when this GUI exits.
 
+Slews can run on the eye lens or on the rig stage's Z axis ("Slew axis"); a stage-Z slew moves the sample
+at the set speed (Zaber move-at-speed, ended by the controller) with the stage Z position logged.
+
+The Andor tab (Connect Andor first) shows the iXon image, the human interface's spectrum and the summed
+intensity against z of the slew axis: Snap, Live (keeps snapping while you jog), an Andor sweep stepped
+along the slew axis through the current z, and a move to the brightest frame.
+
 Every acquisition is plotted (raw channels, fringe envelopes, and
 S = sqrt(A_H^2/DC_H + A_V^2/DC_V)). Nothing is saved automatically: "Save
 recording" writes the last acquisition's raw data to .h5 (or .npz; load with
@@ -42,6 +49,10 @@ from PyQt5.QtWidgets import (
 )
 
 from brillouin_system.devices.ni.ni6008_multi import DIFF_RANGES_V, effective_range_v
+from brillouin_system.guis.homodyne_test.andor_view import (
+    PRELOAD_UM, AndorView, SweepCancelled, andor_sweep, connect_andor, stage_z_mover,
+)
+from brillouin_system.guis.plane_accuracy_test.axial_recording import save_axial
 from brillouin_system.guis.homodyne_test.experiment_plan import (
     MAX_STAGE_STEP_UM, MAX_XY_MOVE_UM, ExperimentStep, StageRef, build_experiment_steps, build_repeat_steps,
     radii_range, stage_ref_distance_mm, stage_ref_lens_um, stage_ref_radii, stage_ref_sphere_radius_mm,
@@ -64,6 +75,7 @@ PRE_ROLL_S = 0.3        # DAQ runs this long before the slew starts (background)
 POST_ROLL_S = 0.3       # and this long after the slew should have ended
 SETTLE_S = 0.2          # pause after the back-off move
 Z_POLL_S = 0.016        # Zaber position-log period (same as the plane finder)
+MAX_TO_BRIGHTEST_UM = 200.0     # "Move to brightest" refuses longer moves
 
 
 @dataclass(frozen=True)
@@ -81,6 +93,7 @@ class SlewSettings:
     speed_um_s: float
     reverse: bool           # False: back off toward -z, slew toward +z
     return_to_start: bool
+    axis: str = "lens"      # "lens" (eye lens) | "stage" (rig stage Z)
 
 
 @dataclass(frozen=True)
@@ -121,12 +134,18 @@ class HomodyneWorker(QObject):
     move_done = pyqtSignal()
     finished = pyqtSignal(object)   # HomodyneRecording
     failed = pyqtSignal(str)
+    andor_connected = pyqtSignal(str)               # error text, empty when fine
+    frame = pyqtSignal(object, float, bool)         # Andor frame (None on error), z of the chosen axis, live
+    sweep_done = pyqtSignal(object)                 # AxialRecording
 
-    def __init__(self, daq, zaber, stage=None):
+    def __init__(self, daq, zaber, stage=None, use_dummy: bool = False):
         super().__init__()
         self.daq = daq
         self.zaber = zaber
         self.stage = stage
+        self.stage_z = stage_z_mover(stage)
+        self.camera = None
+        self._use_dummy = use_dummy
         self._stop = threading.Event()
 
     def request_stop(self) -> None:
@@ -185,6 +204,77 @@ class HomodyneWorker(QObject):
             self.move_done.emit()
         except Exception as e:
             self.failed.emit(f"Eye-lens move failed: {type(e).__name__}: {e}")
+
+    # ---- axis helpers (lens = eye lens, stage = rig stage Z) ----------------------------------------------------
+
+    def _axis_z(self, axis: str) -> float:
+        if axis == "stage":
+            if self.stage is None:
+                raise RuntimeError("Rig stage not connected")
+            return float(self.stage.get_position()[2])
+        return float(self.zaber.get_position())
+
+    def _axis_move(self, axis: str, z: float) -> None:
+        if axis == "stage":
+            self.stage.move_abs(z=z)
+        else:
+            self.zaber.move_abs(z)
+
+    @pyqtSlot(str, float)
+    def move_axis_abs(self, axis: str, z: float):
+        """Absolute move of the lens or stage Z, approached from below (backlash taken up the same way)."""
+        try:
+            self.status.emit(f"{axis} move to {z:.1f} um ...")
+            self._axis_move(axis, z - PRELOAD_UM)
+            self._axis_move(axis, z)
+            self._emit_positions()
+            self.status.emit(f"{axis} at {self._axis_z(axis):.1f} um.")
+            self.move_done.emit()
+        except Exception as e:
+            self.failed.emit(f"{axis} move failed: {type(e).__name__}: {e}")
+
+    # ---- Andor -------------------------------------------------------------------------------------------------
+
+    @pyqtSlot()
+    def connect_andor(self):
+        try:
+            self.status.emit("Connecting the Andor (may take a while) ...")
+            self.camera = connect_andor(self._use_dummy, self.zaber)
+            self.andor_connected.emit("")
+        except Exception as e:
+            self.camera = None
+            self.andor_connected.emit(f"{type(e).__name__}: {e}")
+
+    @pyqtSlot(float, int, str, bool)
+    def snap(self, exposure_s: float, gain: int, axis: str, live: bool):
+        try:
+            self.camera.set_exposure_time(exposure_s)
+            self.camera.set_emccd_gain(gain)
+            f = np.asarray(self.camera.snap())
+            self.frame.emit(f, self._axis_z(axis), live)
+        except Exception as e:
+            self.status.emit(f"Andor snap failed: {type(e).__name__}: {e}")
+            self.frame.emit(None, 0.0, live)
+
+    @pyqtSlot(str, float, int, float, float)
+    def sweep(self, axis: str, exposure_s: float, gain: int, half_um: float, step_um: float):
+        """Andor frames stepping the axis through its current z, then back there."""
+        self._stop.clear()
+        try:
+            self.camera.set_exposure_time(exposure_s)
+            self.camera.set_emccd_gain(gain)
+            self.status.emit(f"Andor sweep along {axis} z, +-{half_um:.0f} um in {step_um:g} um steps ...")
+            rec = andor_sweep(self.camera, lambda: self._axis_z(axis), lambda z: self._axis_move(axis, z),
+                              half_um, step_um, self._stop, lambda f, z: self.frame.emit(f, z, False),
+                              meta={"axis": axis, "created": datetime.now().isoformat(timespec="seconds")})
+            self._emit_positions()
+            self.sweep_done.emit(rec)
+        except SweepCancelled:
+            self._emit_positions()
+            self.status.emit("Sweep stopped; axis back at the start.")
+            self.sweep_done.emit(None)
+        except Exception as e:
+            self.failed.emit(f"Andor sweep failed: {type(e).__name__}: {e}")
 
     @pyqtSlot(object, float, object)
     def run_stationary(self, daq_settings: DaqSettings, duration_s: float, meta: dict):
@@ -262,6 +352,9 @@ class HomodyneWorker(QObject):
 
     @pyqtSlot(object, object, object)
     def run_slew(self, daq_settings: DaqSettings, s: SlewSettings, meta: dict):
+        if s.axis == "stage":
+            self._run_stage_slew(daq_settings, s, meta)
+            return
         self._stop.clear()
         zaber = self.zaber
         z0: Optional[float] = None
@@ -340,6 +433,95 @@ class HomodyneWorker(QObject):
             zlog_t_perf=np.asarray(zlog.t_perf) if zlog is not None else np.empty(0),
             zlog_z_um=np.asarray(zlog.z_um) if zlog is not None else np.empty(0)))
 
+    def _run_stage_slew(self, daq_settings: DaqSettings, s: SlewSettings, meta: dict):
+        """Back off and slew the rig stage Z (moves the sample) at s.speed_um_s while recording; Z position logged.
+        The controller ends the move at the target, and every command is checked against a window around it."""
+        self._stop.clear()
+        mover = self.stage_z
+        if mover is None:
+            self.failed.emit("Rig stage not connected: no stage-Z slew.")
+            return
+        z0: Optional[float] = None
+        moved = False
+        state = {"log": False, "slew": False}
+        t_log, z_log = np.empty(0), np.empty(0)
+        res = None
+        error: Optional[str] = None
+        try:
+            self._apply(daq_settings)
+            z0 = float(mover.get_position())
+            direction = -1.0 if s.reverse else 1.0
+            z_start = z0 - direction * s.backoff_um
+            z_end = z_start + direction * s.range_um
+            mover.set_window(min(z_start, z_end, z0) - PRELOAD_UM - 5.0, max(z_start, z_end, z0) + 5.0)
+            self.status.emit(f"Stage Z backing off {s.backoff_um:.0f} um to {z_start:.1f} um ...")
+            moved = True
+            mover.move_abs(z_start)
+            if self._stop.is_set():
+                raise _Cancelled()
+            time.sleep(SETTLE_S)
+
+            fs = self.daq.sample_rate_hz
+            duration = PRE_ROLL_S + s.range_um / s.speed_um_s + 0.2 + POST_ROLL_S
+            n_pre = int(PRE_ROLL_S * fs)
+
+            def on_chunk(n: int) -> None:
+                if not state["log"]:
+                    mover.start_log(poll_s=Z_POLL_S)
+                    state["log"] = True
+                if not state["slew"] and n >= n_pre:
+                    mover.slew_to(z_end, s.speed_um_s)
+                    state["slew"] = True
+
+            self.status.emit(f"Stage Z slewing {s.range_um:.0f} um at {s.speed_um_s:.0f} um/s ({duration:.1f} s record) ...")
+            res = self.daq.acquire(duration, on_chunk=on_chunk, stop_evt=self._stop)
+            if self._stop.is_set():
+                mover.stop()
+            mover.wait_idle(timeout_s=30.0)
+            meta = dict(meta, z0_um=z0, z_start_um=z_start, z_end_um=z_end, direction=direction,
+                        pre_roll_s=PRE_ROLL_S, post_roll_s=POST_ROLL_S, stopped_early=self._stop.is_set(), **asdict(s))
+        except _Cancelled:
+            error = "Stopped before the slew."
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+        finally:
+            if state["slew"] and error is not None:
+                try:
+                    mover.stop()
+                except Exception as e:
+                    error += f"; stage stop failed: {e}"
+            if state["log"]:
+                try:
+                    t_log, z_log = mover.stop_log()
+                except Exception:
+                    pass
+            if moved and s.return_to_start and z0 is not None:
+                try:
+                    self.status.emit(f"Stage Z back to {z0:.1f} um ...")
+                    mover.move_abs(z0 - PRELOAD_UM)
+                    mover.move_abs(z0)
+                except Exception as e:
+                    error = (error + "; " if error else "") + f"RETURN TO START FAILED: {e}"
+            if hasattr(mover, "restore_speed"):
+                try:
+                    mover.restore_speed()
+                except Exception:
+                    pass
+            try:
+                self._emit_positions()
+            except Exception:
+                pass
+
+        if error is not None and res is None:
+            self.failed.emit(error)
+            return
+        if error is not None:
+            self.status.emit(f"Warning: {error}")
+        self.finished.emit(HomodyneRecording(
+            mode="slew", values=res.values, sample_rate_hz=res.sample_rate_hz,
+            t0_perf=res.t0_perf, channels=tuple(res.channels), meta=meta,
+            zlog_t_perf=np.asarray(t_log), zlog_z_um=np.asarray(z_log)))
+
 
 def _dspin(lo, hi, val, step, decimals=1, suffix="") -> QDoubleSpinBox:
     w = QDoubleSpinBox()
@@ -360,6 +542,10 @@ class HomodyneTestWindow(QWidget):
     _req_stage_rel = pyqtSignal(float, float, float)
     _req_lens_rel = pyqtSignal(float)
     _req_lens_abs = pyqtSignal(float)
+    _req_axis_abs = pyqtSignal(str, float)
+    _req_andor_connect = pyqtSignal()
+    _req_snap = pyqtSignal(float, int, str, bool)
+    _req_sweep = pyqtSignal(str, float, int, float, float)
 
     def __init__(self, *, use_dummy: bool, zaber_port: str = "COM5", ni_device: str = "Dev1",
                  stage_port: str = "COM6", include_eye_tracking: bool = True,
@@ -382,6 +568,9 @@ class HomodyneTestWindow(QWidget):
         self._pending_ref: Optional[str] = None         # "center" | "edge": capture on the next position read
         self._shown_peak = None
         self._shown_peak_z: Optional[float] = None
+        self._last_peak_axis = "lens"
+        self._snap_pending = False
+        self._andor_ok = False
 
         self.daq, self.zaber, connect_error = self._connect(use_dummy, zaber_port, ni_device)
         errors = [connect_error] if connect_error else []
@@ -406,7 +595,7 @@ class HomodyneTestWindow(QWidget):
         self._thread = QThread(self)
         self._worker = None
         if self.zaber is not None:
-            self._worker = HomodyneWorker(self.daq, self.zaber, self.stage)
+            self._worker = HomodyneWorker(self.daq, self.zaber, self.stage, use_dummy=use_dummy)
             self._worker.moveToThread(self._thread)
             self._worker.status.connect(self._set_status)
             self._worker.position.connect(self._set_position)
@@ -421,6 +610,13 @@ class HomodyneTestWindow(QWidget):
             self._req_stage_rel.connect(self._worker.move_stage_rel)
             self._req_lens_rel.connect(self._worker.move_lens_rel)
             self._req_lens_abs.connect(self._worker.move_lens_abs)
+            self._req_axis_abs.connect(self._worker.move_axis_abs)
+            self._req_andor_connect.connect(self._worker.connect_andor)
+            self._req_snap.connect(self._worker.snap)
+            self._req_sweep.connect(self._worker.sweep)
+            self._worker.andor_connected.connect(self._on_andor_connected)
+            self._worker.frame.connect(self._on_frame)
+            self._worker.sweep_done.connect(self._on_sweep_done)
             self._thread.start()
             self._req_position.emit()
         self._set_busy(False)
@@ -576,6 +772,13 @@ class HomodyneTestWindow(QWidget):
         self.backoff = _dspin(0.0, MAX_RANGE_UM, 150.0, 10.0, 1, " um")
         self.scan_range = _dspin(1.0, MAX_RANGE_UM, 300.0, 10.0, 1, " um")
         self.speed = _dspin(1.0, MAX_SPEED_UM_S, 400.0, 50.0, 1, " um/s")
+        self.slew_axis = QComboBox()
+        self.slew_axis.addItems(["Lens", "Stage Z"])
+        self.slew_axis.setToolTip("Lens: the eye lens moves (focus through the surface). Stage Z: the rig stage moves "
+                                  "the sample at the set speed. Also the axis of the Andor sweep and summed plot.")
+        if self.stage is None:
+            self.slew_axis.model().item(1).setEnabled(False)
+        self.slew_axis.currentIndexChanged.connect(self._on_axis_changed)
         self.reverse = QCheckBox("Back off toward +z, slew toward -z")
         self.return_to_start = QCheckBox("Return to start z afterwards")
         self.return_to_start.setChecked(True)
@@ -584,6 +787,7 @@ class HomodyneTestWindow(QWidget):
         self.slew_btn = QPushButton("Back off + slew")
         self.slew_btn.clicked.connect(self._start_slew)
         self.speed.valueChanged.connect(self._update_fringe_info)
+        f.addRow("Slew axis:", self.slew_axis)
         f.addRow("Back off:", self.backoff)
         f.addRow("Scan range:", self.scan_range)
         f.addRow("Speed:", self.speed)
@@ -667,6 +871,7 @@ class HomodyneTestWindow(QWidget):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(data_tab, "Data")
+        self.tabs.addTab(self._build_andor_tab(), "Andor")
         if self.eye_panel is not None:
             self.tabs.addTab(self.eye_panel, "Eye tracking")
 
@@ -681,6 +886,54 @@ class HomodyneTestWindow(QWidget):
         main.addWidget(scroll)
         main.addWidget(pos_scroll)
         main.addWidget(self.tabs, stretch=1)
+
+    def _build_andor_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        g = QGroupBox("Andor")
+        g.setFixedWidth(300)
+        f = QFormLayout(g)
+        self.andor_label = QLabel("Not connected")
+        self.andor_connect_btn = QPushButton("Connect Andor")
+        self.andor_connect_btn.setToolTip("Close the human interface and other test GUIs first (one program per camera).")
+        self.andor_connect_btn.clicked.connect(self._connect_andor)
+        self.exposure = _dspin(0.001, 5.0, 0.1, 0.05, 3, " s")
+        self.gain = QSpinBox()
+        self.gain.setRange(0, 300)
+        self.snap_btn = QPushButton("Snap")
+        self.snap_btn.clicked.connect(self._snap)
+        self.live_btn = QPushButton("Live")
+        self.live_btn.setCheckable(True)
+        self.live_btn.setToolTip("Keeps snapping; jog the slew axis to fill the summed-intensity plot.")
+        self.live_btn.toggled.connect(self._toggle_live)
+        row = QHBoxLayout()
+        row.addWidget(self.snap_btn)
+        row.addWidget(self.live_btn)
+        self.sweep_half = _dspin(4.0, 200.0, 40.0, 5.0, 0, " um")
+        self.sweep_step = _dspin(0.5, 20.0, 2.0, 0.5, 1, " um")
+        self.sweep_btn = QPushButton("Andor sweep here (lens)")
+        self.sweep_btn.setToolTip("Frames stepping the slew axis through its current z (from below), then back.")
+        self.sweep_btn.clicked.connect(self._sweep)
+        self.bright_btn = QPushButton("Move lens to brightest")
+        self.bright_btn.clicked.connect(self._to_brightest)
+        self.clear_sum_btn = QPushButton("Clear summed plot")
+        self.clear_sum_btn.clicked.connect(lambda: self.andor_view.clear())
+        self.save_sweeps = QCheckBox("Save each sweep (.h5 in the save folder)")
+        f.addRow(self.andor_label)
+        f.addRow(self.andor_connect_btn)
+        f.addRow("Exposure:", self.exposure)
+        f.addRow("EM gain:", self.gain)
+        f.addRow(row)
+        f.addRow("Sweep +-:", self.sweep_half)
+        f.addRow("Sweep step:", self.sweep_step)
+        f.addRow(self.sweep_btn)
+        f.addRow(self.bright_btn)
+        f.addRow(self.clear_sum_btn)
+        f.addRow(self.save_sweeps)
+        self.andor_view = AndorView()
+        lay.addWidget(g)
+        lay.addWidget(self.andor_view, stretch=1)
+        return w
 
     def _build_positioning_controls(self) -> QWidget:
         w = QWidget()
@@ -721,8 +974,8 @@ class HomodyneTestWindow(QWidget):
         g = QGroupBox("Reflection plane")
         f = QFormLayout(g)
         self.peak_label = QLabel("Last slew peak: —")
-        self.go_peak_btn = QPushButton("Move lens to last slew peak")
-        self.go_peak_btn.setToolTip("Absolute eye-lens move to the S peak of the last slew "
+        self.go_peak_btn = QPushButton("Move to last slew peak")
+        self.go_peak_btn.setToolTip("Absolute move of the last slew's axis (lens or stage Z) to its S peak "
                                     "(forward/backward slews differ by ~±2 um of timing lag).")
         self.go_peak_btn.clicked.connect(self._go_to_peak)
         f.addRow(self.peak_label)
@@ -992,6 +1245,12 @@ class HomodyneTestWindow(QWidget):
         self.sr_center_btn.setEnabled(idle and has_stage)
         self.sr_edge_btn.setEnabled(idle and has_stage)
         self.sr_btn.setEnabled(idle and has_stage and self._center_ref is not None and self._edge_ref is not None)
+        self.slew_axis.setEnabled(not busy)
+        cam = idle and self._andor_ok
+        self.andor_connect_btn.setEnabled(idle and not self._andor_ok)
+        for b in (self.snap_btn, self.sweep_btn, self.bright_btn):
+            b.setEnabled(cam)
+        self.live_btn.setEnabled(connected and self._andor_ok)
 
     @pyqtSlot(str)
     def _set_status(self, text: str):
@@ -1085,7 +1344,104 @@ class HomodyneTestWindow(QWidget):
         if self._last_peak_z is None:
             return
         self._set_busy(True)
-        self._req_lens_abs.emit(self._last_peak_z)
+        if self._last_peak_axis == "stage":
+            self._req_axis_abs.emit("stage", self._last_peak_z)
+        else:
+            self._req_lens_abs.emit(self._last_peak_z)
+
+    # ------------------------------------------------------------------ slew axis + Andor
+
+    def _axis(self) -> str:
+        return "stage" if self.slew_axis.currentIndex() == 1 else "lens"
+
+    def _on_axis_changed(self, *_):
+        ax = self._axis()
+        name = "lens" if ax == "lens" else "stage Z"
+        self.sweep_btn.setText(f"Andor sweep here ({name})")
+        self.bright_btn.setText(f"Move {name} to brightest")
+        self.andor_view.set_axis(ax)
+
+    def _connect_andor(self):
+        self._set_busy(True)
+        self._req_andor_connect.emit()
+
+    @pyqtSlot(str)
+    def _on_andor_connected(self, err: str):
+        self._andor_ok = not err
+        self.andor_label.setText("Connected" if not err else f"Not connected: {err}")
+        self._set_busy(False)
+        if err:
+            QMessageBox.warning(self, "Andor", err)
+        else:
+            self._set_status("Andor connected.")
+
+    def _stop_live(self):
+        if self.live_btn.isChecked():
+            self.live_btn.setChecked(False)
+
+    def _snap(self):
+        if not self._snap_pending:
+            self._snap_pending = True
+            self._req_snap.emit(self.exposure.value(), self.gain.value(), self._axis(), False)
+
+    def _toggle_live(self, on: bool):
+        if on and not self._snap_pending:
+            self._snap_pending = True
+            self._req_snap.emit(self.exposure.value(), self.gain.value(), self._axis(), True)
+
+    @pyqtSlot(object, float, bool)
+    def _on_frame(self, frame, z: float, live: bool):
+        sweeping = not live and self._busy
+        if not sweeping:
+            self._snap_pending = False
+        if frame is None:
+            self._stop_live()
+            self._snap_pending = False
+            return
+        self.andor_view.add_frame(frame, z)
+        if live and self.live_btn.isChecked():
+            self._snap_pending = True
+            self._req_snap.emit(self.exposure.value(), self.gain.value(), self._axis(), True)
+
+    def _sweep(self):
+        self._stop_live()
+        self.andor_view.set_axis(self._axis())
+        self.andor_view.clear()
+        self._set_busy(True)
+        self._req_sweep.emit(self._axis(), self.exposure.value(), self.gain.value(),
+                             self.sweep_half.value(), self.sweep_step.value())
+
+    @pyqtSlot(object)
+    def _on_sweep_done(self, rec):
+        self._set_busy(False)
+        if rec is None:
+            return
+        msg = f"Andor sweep done: {len(rec.z_um)} frames along {rec.meta.get('axis')} z"
+        b = self.andor_view.brightest()
+        if b is not None:
+            msg += f", brightest at {b:.1f} um"
+        if self.save_sweeps.isChecked():
+            path = Path(self.save_dir.text()) / f"{datetime.now():%Y%m%d_%H%M%S}_andor_sweep_{rec.meta.get('axis')}.h5"
+            try:
+                save_axial(rec, path)
+                msg += f"; saved {path.name}"
+            except Exception as e:
+                msg += f"; SAVE FAILED: {e}"
+        self._set_status(msg)
+
+    def _to_brightest(self):
+        b = self.andor_view.brightest()
+        ax = self.andor_view.axis
+        if b is None:
+            QMessageBox.information(self, "Brightest", "Run an Andor sweep (or Live while jogging) first.")
+            return
+        now = self._lens_um if ax == "lens" else (self._stage_xyz[2] if self._stage_xyz else None)
+        if now is not None and abs(b - now) > MAX_TO_BRIGHTEST_UM:
+            QMessageBox.warning(self, "Brightest", f"Brightest frame is {b - now:+.0f} um away "
+                                                   f"(limit {MAX_TO_BRIGHTEST_UM:.0f} um); clear the plot and sweep again.")
+            return
+        self._set_busy(True)
+        self._req_axis_abs.emit(ax, b)
 
     def _open_et_config(self):
         from brillouin_system.eye_tracker.eye_tracker_config.eye_tracker_config_gui import EyeTrackerConfigDialog
@@ -1172,6 +1528,7 @@ class HomodyneTestWindow(QWidget):
         """Shared start for the eye-tracking experiment and the repeat run."""
         if not self._confirm_discard_unsaved("start the run"):
             return
+        self._stop_live()
         run_dir = Path(self.save_dir.text()) / f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         r = QMessageBox.question(
             self, "Start automated run",
@@ -1582,6 +1939,7 @@ class HomodyneTestWindow(QWidget):
         except ValueError as e:
             QMessageBox.warning(self, "DAQ settings", str(e))
             return
+        self._stop_live()
         self._set_busy(True)
         self._req_stationary.emit(self._daq_settings(), float(self.duration.value()), self._base_meta())
 
@@ -1599,7 +1957,16 @@ class HomodyneTestWindow(QWidget):
             speed_um_s=self.speed.value(),
             reverse=self.reverse.isChecked(),
             return_to_start=self.return_to_start.isChecked(),
+            axis=self._axis(),
         )
+        if s.axis == "stage":
+            r = QMessageBox.question(
+                self, "Stage-Z slew",
+                f"The rig stage will move the sample: back off {s.backoff_um:.0f} um, then slew {s.range_um:.0f} um at "
+                f"{s.speed_um_s:.0f} um/s ({'toward -z' if s.reverse else 'toward +z'}). Continue?")
+            if r != QMessageBox.Yes:
+                return
+        self._stop_live()
         if s.backoff_um >= s.range_um:
             r = QMessageBox.question(
                 self, "Plane outside scan?",
@@ -1641,8 +2008,9 @@ class HomodyneTestWindow(QWidget):
         # only live slews feed "move to peak" (never a loaded file from another session)
         if rec.mode == "slew":
             self._last_peak_z = self._shown_peak_z
+            self._last_peak_axis = rec.meta.get("axis", "lens")
             self.peak_label.setText(
-                f"Last slew peak: z = {self._last_peak_z:.2f} um" if self._last_peak_z is not None
+                f"Last slew peak: {self._last_peak_axis} z = {self._last_peak_z:.2f} um" if self._last_peak_z is not None
                 else "Last slew peak: none found")
             self._set_busy(False)
 
@@ -1717,7 +2085,7 @@ class HomodyneTestWindow(QWidget):
                  f"{n} samples x {v.shape[0]} ch @ {fs:.0f} S/s = {n / fs:.2f} s"]
 
         z = rec.z_um() if rec.mode == "slew" else None
-        x, xlabel = (z, "z (um)") if z is not None else (rec.t_s(), "time (s)")
+        x, xlabel = (z, f"{rec.meta.get('axis', 'lens')} z (um)") if z is not None else (rec.t_s(), "time (s)")
 
         trace = None
         if n >= 10:
@@ -1759,7 +2127,7 @@ class HomodyneTestWindow(QWidget):
                 if peak.found and z is not None:
                     self._shown_peak_z = peak.x_peak
                 if peak.found:
-                    lines.append(f"Surface peak at {xlabel.split()[0]} = {peak.x_peak:.2f} "
+                    lines.append(f"Surface peak at {xlabel.rsplit(' ', 1)[0]} = {peak.x_peak:.2f} "
                                  f"(SNR {peak.snr:.1f}, S {peak.s_peak:.4f})")
                 else:
                     lines.append(f"No surface peak (SNR {peak.snr:.1f} < threshold)")
@@ -1804,6 +2172,11 @@ class HomodyneTestWindow(QWidget):
             QMessageBox.warning(self, "Busy", "Worker did not finish; closing anyway.")
         if self.eye_panel is not None:
             self.eye_panel.shutdown()
+        if self._worker is not None and self._worker.camera is not None:
+            try:
+                self._worker.camera.close()
+            except Exception:
+                pass
         if self.stage is not None:
             try:
                 self.stage.close()     # serial port only; never moves
