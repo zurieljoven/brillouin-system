@@ -15,6 +15,7 @@ and "Move lens to last slew peak" to get back onto the surface).
 
 Slews run on the eye lens or the rig stage Z ("Slew axis"). The Andor tab connects the iXon only when
 you press "Connect Andor"; close the human interface and the other test GUIs first (one program per camera).
+The Spectrograms tab shows each channel's spectrogram for the last recording (or a loaded file).
 
 Wiring (USB-6008 analog terminal block, RSE):
     PD H (PBS output 1): signal -> pin 2 (AI0), shield -> pin 1 (GND)

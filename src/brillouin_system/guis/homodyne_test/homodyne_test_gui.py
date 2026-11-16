@@ -53,6 +53,7 @@ from brillouin_system.guis.homodyne_test.andor_view import (
     PRELOAD_UM, AndorView, SweepCancelled, andor_sweep, connect_andor, stage_z_mover,
 )
 from brillouin_system.guis.plane_accuracy_test.axial_recording import save_axial
+from brillouin_system.guis.homodyne_test.spectrogram_view import SpectrogramView
 from brillouin_system.guis.homodyne_test.experiment_plan import (
     MAX_STAGE_STEP_UM, MAX_XY_MOVE_UM, ExperimentStep, StageRef, build_experiment_steps, build_repeat_steps,
     radii_range, stage_ref_distance_mm, stage_ref_lens_um, stage_ref_radii, stage_ref_sphere_radius_mm,
@@ -871,6 +872,8 @@ class HomodyneTestWindow(QWidget):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(data_tab, "Data")
+        self.spec_view = SpectrogramView()
+        self.tabs.addTab(self.spec_view, "Spectrograms")
         self.tabs.addTab(self._build_andor_tab(), "Andor")
         if self.eye_panel is not None:
             self.tabs.addTab(self.eye_panel, "Eye tracking")
@@ -2154,6 +2157,16 @@ class HomodyneTestWindow(QWidget):
         axs[2].set_xlabel(xlabel)
         axs[0].set_title(f"{rec.mode} — {rec.meta.get('created', '')}", fontsize=9)
         self.canvas.draw_idle()
+
+        t_peak = None
+        if peak is not None and peak.found and trace is not None:
+            e = min(edge, max(0, n // 2 - 1))
+            t_peak = float(rec.t_s()[e + int(np.argmax(trace.s[e:n - e]))])
+        try:
+            self.spec_view.show_recording(rec, z, t_peak, f"{rec.mode} — {rec.meta.get('created', '')}")
+        except Exception as ex:
+            lines.append(f"Spectrogram failed: {type(ex).__name__}: {ex}")
+            self.summary.setPlainText("\n".join(lines))
 
     # ------------------------------------------------------------------ shutdown
 
