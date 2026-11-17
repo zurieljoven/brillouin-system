@@ -142,3 +142,64 @@ def stage_ref_xy_um(center: StageRef, edge: StageRef, r_mm: float) -> tuple[floa
     f = float(r_mm) / stage_ref_distance_mm(center, edge)
     return (center.stage_x_um + f * (edge.stage_x_um - center.stage_x_um),
             center.stage_y_um + f * (edge.stage_y_um - center.stage_y_um))
+
+
+# ---- measured surface profile: center, intermediate points, edge --------------------------------------------------
+
+MAX_POINT_OFF_LINE_UM = 100.0   # an intermediate point must sit on the center -> edge line (trials run along it)
+MAX_POINT_DZ_UM = 5.0           # and at the center's stage Z (the runs never move stage Z)
+MIN_POINT_GAP_MM = 0.05
+
+
+def stage_ref_point_r_mm(center: StageRef, edge: StageRef, p: StageRef) -> tuple[float, float]:
+    """(radius along the center -> edge line [mm], distance off that line [um]) of point p."""
+    ux, uy = edge.stage_x_um - center.stage_x_um, edge.stage_y_um - center.stage_y_um
+    n = float(np.hypot(ux, uy))
+    if n <= 0.0:
+        raise ValueError("Center and edge are at the same stage XY")
+    dx, dy = p.stage_x_um - center.stage_x_um, p.stage_y_um - center.stage_y_um
+    return (dx * ux + dy * uy) / n / 1000.0, abs(dx * uy - dy * ux) / n
+
+
+def profile_nodes(center: StageRef, edge: StageRef, points=()) -> tuple[np.ndarray, np.ndarray]:
+    """Sorted (r [mm], lens z [um]) of center, every intermediate point and edge; checks the points."""
+    d = stage_ref_distance_mm(center, edge)
+    r, z = [0.0, d], [center.lens_um, edge.lens_um]
+    for i, p in enumerate(points, 1):
+        rp, off = stage_ref_point_r_mm(center, edge, p)
+        if off > MAX_POINT_OFF_LINE_UM:
+            raise ValueError(f"Point {i} is {off:.0f} um off the center -> edge line (limit {MAX_POINT_OFF_LINE_UM:.0f})")
+        if abs(p.stage_z_um - center.stage_z_um) > MAX_POINT_DZ_UM:
+            raise ValueError(f"Point {i}: stage Z differs from the center by {p.stage_z_um - center.stage_z_um:+.1f} um")
+        if not 0.0 < rp < d:
+            raise ValueError(f"Point {i} is at R = {rp:.2f} mm, outside the center -> edge range (0..{d:.2f} mm)")
+        r.append(rp)
+        z.append(p.lens_um)
+    order = np.argsort(r)
+    r, z = np.asarray(r)[order], np.asarray(z)[order]
+    if np.any(np.diff(r) < MIN_POINT_GAP_MM):
+        raise ValueError(f"Points closer than {MIN_POINT_GAP_MM} mm along the line")
+    return r, z
+
+
+def profile_lens_um(center: StageRef, edge: StageRef, points, r_mm: float) -> float:
+    """Predicted lens z at r_mm: the 2-point sphere without intermediate points, else a shape-preserving (PCHIP)
+    interpolation through center, points and edge, so it passes through every measured plane exactly."""
+    if not points:
+        return stage_ref_lens_um(center, edge, r_mm)
+    from scipy.interpolate import PchipInterpolator
+    r, z = profile_nodes(center, edge, points)
+    return float(PchipInterpolator(r, z)(np.clip(float(r_mm), r[0], r[-1])))
+
+
+def circle_fit_mm(r_mm: np.ndarray, z_um: np.ndarray) -> Optional[tuple[float, float, np.ndarray]]:
+    """Least-squares circle through (r, z) in mm: (radius [mm], apex r [mm], residuals [um]). None if < 3 points."""
+    if len(r_mm) < 3:
+        return None
+    x, y = np.asarray(r_mm, float), np.asarray(z_um, float) / 1000.0
+    A = np.column_stack([x, y, np.ones_like(x)])
+    a, b, c = np.linalg.lstsq(A, x * x + y * y, rcond=None)[0]
+    x0, y0 = a / 2.0, b / 2.0
+    R = float(np.sqrt(c + x0 * x0 + y0 * y0))
+    res = (np.hypot(x - x0, y - y0) - R) * 1000.0
+    return R, float(x0), res

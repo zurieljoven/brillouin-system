@@ -54,6 +54,10 @@ from brillouin_system.guis.homodyne_test.andor_view import (
 )
 from brillouin_system.guis.plane_accuracy_test.axial_recording import save_axial
 from brillouin_system.guis.homodyne_test.spectrogram_view import SpectrogramView
+from brillouin_system.guis.homodyne_test.protocol_panel import ProtocolPanel
+from brillouin_system.guis.plane_accuracy_test.runner import Devices as PlaneAccuracyDevices, run_experiment
+from brillouin_system.guis.z_carrier_test.motion import SimAxisMover, ZaberAxisMover
+from brillouin_system.guis.z_carrier_test.runner import Rig, run_protocol
 from brillouin_system.guis.homodyne_test.experiment_plan import (
     MAX_STAGE_STEP_UM, MAX_XY_MOVE_UM, ExperimentStep, StageRef, build_experiment_steps, build_repeat_steps,
     radii_range, stage_ref_distance_mm, stage_ref_lens_um, stage_ref_radii, stage_ref_sphere_radius_mm,
@@ -138,6 +142,8 @@ class HomodyneWorker(QObject):
     andor_connected = pyqtSignal(str)               # error text, empty when fine
     frame = pyqtSignal(object, float, bool)         # Andor frame (None on error), z of the chosen axis, live
     sweep_done = pyqtSignal(object)                 # AxialRecording
+    protocol_result = pyqtSignal(object, object)    # log row (None for a re-centre sweep), recording
+    protocol_done = pyqtSignal(str)
 
     def __init__(self, daq, zaber, stage=None, use_dummy: bool = False):
         super().__init__()
@@ -276,6 +282,61 @@ class HomodyneWorker(QObject):
             self.sweep_done.emit(None)
         except Exception as e:
             self.failed.emit(f"Andor sweep failed: {type(e).__name__}: {e}")
+
+    # ---- automated protocols (borrowed runners, unchanged) ------------------------------------------------------
+
+    def _protocol_checks(self) -> None:
+        if self.camera is None:
+            raise RuntimeError("Connect the Andor first (Andor tab)")
+        if self.stage is None:
+            raise RuntimeError("Rig stage not connected")
+
+    def _protocol_end(self, name: str, counts: dict, run_dir: Path) -> None:
+        try:
+            self._emit_positions()
+        except Exception:
+            pass
+        how = "stopped" if self._stop.is_set() else "done"
+        self.protocol_done.emit(f"{name} {how}: " + ", ".join(f"{k} {v}" for k, v in counts.items()) + f". Files in {run_dir}")
+
+    @pyqtSlot(object, object, object, object)
+    def run_glass_protocol(self, daq_settings: DaqSettings, cfg, run_dir: Path, shutters):
+        """z_carrier_test.runner.run_protocol from the current lens and stage-Z positions (lens parked on the plane)."""
+        self._stop.clear()
+        try:
+            self._protocol_checks()
+            self._apply(daq_settings)
+            lens = SimAxisMover("lens", self.zaber) if self._use_dummy else ZaberAxisMover("lens", self.zaber.axis)
+            rig = Rig(self.daq, lens, self.stage_z, self.camera, shutters)
+            counts = run_protocol(rig, cfg, run_dir, self._stop, on_status=self.status.emit,
+                                  on_result=lambda row, rec: self.protocol_result.emit(row, rec),
+                                  on_frame=lambda f, z: self.frame.emit(f, float(z), False))
+            self._protocol_end("Glass protocol", counts, run_dir)
+        except Exception as e:
+            try:
+                self._emit_positions()
+            except Exception:
+                pass
+            self.failed.emit(f"Glass protocol failed: {type(e).__name__}: {e} (files so far in {run_dir})")
+
+    @pyqtSlot(object, object, object, object)
+    def run_phantom_protocol(self, daq_settings: DaqSettings, cfg, run_dir: Path, shutters):
+        """plane_accuracy_test.runner.run_experiment: finder fwd/bwd + Andor axial at every radius."""
+        self._stop.clear()
+        try:
+            self._protocol_checks()
+            self._apply(daq_settings)
+            dev = PlaneAccuracyDevices(self.daq, self.zaber, self.stage, self.camera, shutters)
+            counts = run_experiment(dev, cfg, run_dir, self._stop, on_status=self.status.emit,
+                                    on_trial=lambda row, rec: self.protocol_result.emit(row, rec),
+                                    on_frame=lambda f, z: self.frame.emit(f, float(z), False))
+            self._protocol_end("Phantom protocol", counts, run_dir)
+        except Exception as e:
+            try:
+                self._emit_positions()
+            except Exception:
+                pass
+            self.failed.emit(f"Phantom protocol failed: {type(e).__name__}: {e} (files so far in {run_dir})")
 
     @pyqtSlot(object, float, object)
     def run_stationary(self, daq_settings: DaqSettings, duration_s: float, meta: dict):
@@ -547,6 +608,8 @@ class HomodyneTestWindow(QWidget):
     _req_andor_connect = pyqtSignal()
     _req_snap = pyqtSignal(float, int, str, bool)
     _req_sweep = pyqtSignal(str, float, int, float, float)
+    _req_glass = pyqtSignal(object, object, object, object)
+    _req_phantom = pyqtSignal(object, object, object, object)
 
     def __init__(self, *, use_dummy: bool, zaber_port: str = "COM5", ni_device: str = "Dev1",
                  stage_port: str = "COM6", include_eye_tracking: bool = True,
@@ -572,6 +635,7 @@ class HomodyneTestWindow(QWidget):
         self._last_peak_axis = "lens"
         self._snap_pending = False
         self._andor_ok = False
+        self._proto_dir: Optional[Path] = None      # run folder of the protocol in progress
 
         self.daq, self.zaber, connect_error = self._connect(use_dummy, zaber_port, ni_device)
         errors = [connect_error] if connect_error else []
@@ -618,6 +682,10 @@ class HomodyneTestWindow(QWidget):
             self._worker.andor_connected.connect(self._on_andor_connected)
             self._worker.frame.connect(self._on_frame)
             self._worker.sweep_done.connect(self._on_sweep_done)
+            self._req_glass.connect(self._worker.run_glass_protocol)
+            self._req_phantom.connect(self._worker.run_phantom_protocol)
+            self._worker.protocol_result.connect(self._on_protocol_result)
+            self._worker.protocol_done.connect(self._on_protocol_done)
             self._thread.start()
             self._req_position.emit()
         self._set_busy(False)
@@ -875,6 +943,14 @@ class HomodyneTestWindow(QWidget):
         self.spec_view = SpectrogramView()
         self.tabs.addTab(self.spec_view, "Spectrograms")
         self.tabs.addTab(self._build_andor_tab(), "Andor")
+        self.protocol_panel = ProtocolPanel()
+        self.protocol_panel.start_glass.connect(self._start_glass_protocol)
+        self.protocol_panel.start_phantom.connect(self._start_phantom_protocol)
+        self.protocol_panel.capture_point.connect(lambda: self._sr_capture("point"))
+        proto_scroll = QScrollArea()
+        proto_scroll.setWidget(self.protocol_panel)
+        proto_scroll.setWidgetResizable(True)
+        self.tabs.addTab(proto_scroll, "Protocols")
         if self.eye_panel is not None:
             self.tabs.addTab(self.eye_panel, "Eye tracking")
 
@@ -1254,6 +1330,9 @@ class HomodyneTestWindow(QWidget):
         for b in (self.snap_btn, self.sweep_btn, self.bright_btn):
             b.setEnabled(cam)
         self.live_btn.setEnabled(connected and self._andor_ok)
+        proto = idle and has_stage and self._andor_ok
+        self.protocol_panel.set_enabled(proto, proto and self._center_ref is not None and self._edge_ref is not None,
+                                        idle and has_stage)
 
     @pyqtSlot(str)
     def _set_status(self, text: str):
@@ -1574,6 +1653,11 @@ class HomodyneTestWindow(QWidget):
             self._set_status(f"Set {which}: no stage or lens position yet.")
             return
         ref = StageRef(*self._stage_xyz, lens_um=self._lens_um)
+        if which == "point":
+            self.protocol_panel.add_point(ref)
+            self._set_status(f"Intermediate point stored: stage {ref.stage_x_um:.1f} / {ref.stage_y_um:.1f} um, "
+                             f"lens {ref.lens_um:.1f} um.")
+            return
         if which == "center":
             self._center_ref = ref
         else:
@@ -1583,6 +1667,7 @@ class HomodyneTestWindow(QWidget):
                       f"{ref.stage_z_um:.1f} um, lens {ref.lens_um:.1f} um")
         self._set_status(f"{which.capitalize()} set.")
         self._sr_update_info()
+        self.protocol_panel.set_refs(self._center_ref, self._edge_ref)
         self._set_busy(self._busy)
 
     def _sr_plan(self) -> dict:
@@ -1927,6 +2012,61 @@ class HomodyneTestWindow(QWidget):
                          f"{len(e.steps) - e.i} not run. Folder: {e.run_dir}")
         self._set_busy(False)
 
+    # ------------------------------------------------------------------ automated protocols
+
+    def _protocol_start(self, kind: str, cfg, req, text: str) -> None:
+        try:
+            self._daq_settings_validated()
+        except ValueError as e:
+            QMessageBox.warning(self, "DAQ settings", str(e))
+            return
+        if not self._confirm_discard_unsaved(f"start the {kind} protocol"):
+            return
+        tag = f"zcarrier_{cfg.sample}" if kind == "glass" else "plane_accuracy"
+        run_dir = Path(self.save_dir.text()) / f"{tag}_{datetime.now():%Y%m%d_%H%M%S}"
+        r = QMessageBox.question(self, f"Start {kind} protocol", f"{text}\n\nFiles go to {run_dir}.\nContinue?")
+        if r != QMessageBox.Yes:
+            return
+        self._stop_live()
+        self.andor_view.set_axis("lens")
+        self.andor_view.clear()
+        self._proto_dir = run_dir
+        self._set_busy(True)
+        req.emit(self._daq_settings(), cfg, run_dir, self.shutters)
+
+    def _start_glass_protocol(self, cfg):
+        self._protocol_start(
+            "glass", cfg, self._req_glass,
+            f"{len(cfg.steps())} steps (about {cfg.estimated_s() / 60:.0f} min). The lens must be parked on the "
+            f"plane now. Lens and stage Z (moves the sample) slew ±{cfg.slew_half_um:.0f} um around their current "
+            f"positions at {', '.join(f'{v:.0f}' for v in cfg.speeds_um_s)} um/s, with Andor sweeps "
+            f"±{cfg.andor_half_um:.0f} um on both axes at the start and the end. The sample shutter opens.")
+
+    def _start_phantom_protocol(self, cfg):
+        self._protocol_start(
+            "phantom", cfg, self._req_phantom,
+            f"{len(cfg.trials())} trials over {len(cfg.radii())} radii (about {cfg.estimated_s() / 60:.0f} min). "
+            f"The stage moves in X/Y between center and edge (Z never), the lens backs off before every XY move. "
+            f"The sample shutter opens.")
+
+    @pyqtSlot(object, object)
+    def _on_protocol_result(self, row, rec):
+        if isinstance(rec, HomodyneRecording):
+            self._last_rec = rec
+            self._last_path = self._proto_dir / row["file"] if row and row.get("file") and self._proto_dir else None
+            self._unsaved = False
+            self._show(rec)
+        if row:
+            peak = row.get("peak_rel_um", row.get("finder_z_um"))
+            self.peak_label.setText(f"Last protocol step: {row.get('file', '')}"
+                                    + (f", peak {peak:+.1f} um" if isinstance(peak, float) else ""))
+
+    @pyqtSlot(str)
+    def _on_protocol_done(self, msg: str):
+        self._proto_dir = None
+        self._set_busy(False)
+        self._set_status(msg)
+
     def _browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Save folder", self.save_dir.text())
         if d:
@@ -2055,6 +2195,7 @@ class HomodyneTestWindow(QWidget):
         if self._exp is not None:
             self._exp_on_failed(msg)
             return
+        self._proto_dir = None
         self._pending_z_after_xy = False
         self._set_busy(False)
         self._set_status(f"Error: {msg}")

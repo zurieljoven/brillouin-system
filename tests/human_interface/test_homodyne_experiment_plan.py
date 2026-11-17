@@ -123,3 +123,27 @@ def test_stage_ref_radii_no_duplicate_edge_from_readback_jitter():
     e = StageRef(13250.01, 10700.0, 0.0, 1450.0)  # 2.75001 mm
     radii = stage_ref_radii(c, e, 0.25)
     assert len(radii) == 12 and radii[-1] == pytest.approx(2.75001) and radii[-2] == pytest.approx(2.5)
+
+
+def test_profile_through_points_and_checks():
+    import numpy as np
+    import pytest
+    from brillouin_system.guis.homodyne_test.experiment_plan import (
+        StageRef, circle_fit_mm, profile_lens_um, profile_nodes, stage_ref_lens_um,
+    )
+    R = 7.8
+    sag = lambda r: 1000.0 * (R - np.sqrt(R * R - r * r))
+    c, e = StageRef(0.0, 0.0, 5.0, 1000.0), StageRef(3000.0, 0.0, 5.0, 1000.0 + sag(3.0))
+    pts = (StageRef(1500.0, 20.0, 5.0, 1000.0 + sag(1.5) + 10.0),)       # measured plane 10 um off the sphere
+    assert profile_lens_um(c, e, (), 2.0) == pytest.approx(stage_ref_lens_um(c, e, 2.0))
+    assert profile_lens_um(c, e, pts, 1.5) == pytest.approx(pts[0].lens_um)       # passes through the point
+    r, z = profile_nodes(c, e, (StageRef(1000.0, 0.0, 5.0, 1000.0 + sag(1.0)),
+                                StageRef(2000.0, 0.0, 5.0, 1000.0 + sag(2.0))))
+    fit = circle_fit_mm(r, z)
+    assert fit[0] == pytest.approx(R, rel=1e-3) and abs(fit[1]) < 1e-3
+    with pytest.raises(ValueError, match="off the center"):
+        profile_nodes(c, e, (StageRef(1500.0, 500.0, 5.0, 1000.0),))
+    with pytest.raises(ValueError, match="stage Z"):
+        profile_nodes(c, e, (StageRef(1500.0, 0.0, 50.0, 1000.0),))
+    with pytest.raises(ValueError, match="outside"):
+        profile_nodes(c, e, (StageRef(3500.0, 0.0, 5.0, 1000.0),))

@@ -22,8 +22,8 @@ from typing import Callable, Optional
 import numpy as np
 
 from brillouin_system.guis.homodyne_test.experiment_plan import (
-    MAX_STAGE_STEP_UM, StageRef, stage_ref_distance_mm, stage_ref_lens_um, stage_ref_radii,
-    stage_ref_sphere_radius_mm, stage_ref_xy_um,
+    MAX_STAGE_STEP_UM, StageRef, circle_fit_mm, profile_lens_um, profile_nodes, stage_ref_distance_mm,
+    stage_ref_point_r_mm, stage_ref_radii, stage_ref_sphere_radius_mm, stage_ref_xy_um,
 )
 from brillouin_system.guis.plane_accuracy_test.axial_recording import AxialRecording, save_axial
 from brillouin_system.guis.plane_accuracy_test.trial_plan import Trial, axial_positions_um, build_trials
@@ -71,6 +71,11 @@ class RunConfig:
     gain: int = 0
     sample_rate_hz: float = 5000.0
     close_shutters_at_end: bool = True
+    points: tuple = ()          # measured intermediate planes (StageRef) on the center -> edge line; none = sphere
+
+    def lens_pred_um(self, r_mm: float) -> float:
+        """Predicted lens z of the plane at r_mm: through every measured plane when points are set."""
+        return profile_lens_um(self.center, self.edge, self.points, r_mm)
 
     def radii(self) -> list[float]:
         return stage_ref_radii(self.center, self.edge, self.r_step_mm)
@@ -93,6 +98,7 @@ class RunConfig:
         d_um = 1000.0 * stage_ref_distance_mm(self.center, self.edge)
         if d_um + STAGE_PRELOAD_UM > MAX_STAGE_STEP_UM:
             raise ValueError(f"Center to edge is {d_um:.0f} um, above the {MAX_STAGE_STEP_UM:.0f} um limit.")
+        profile_nodes(self.center, self.edge, self.points)
 
     def estimated_s(self) -> float:
         n_r, b = len(self.radii()), self.n_blocks
@@ -103,9 +109,16 @@ class RunConfig:
 
     def plan_dict(self) -> dict:
         radii = self.radii()
+        r_n, z_n = profile_nodes(self.center, self.edge, self.points)
+        fit = circle_fit_mm(r_n, z_n)
         return dict(asdict(self), radii_mm=radii, mode="plane_accuracy", in_vitro=True,
                     sphere_radius_mm=stage_ref_sphere_radius_mm(self.center, self.edge),
-                    lens_pred_um=[stage_ref_lens_um(self.center, self.edge, r) for r in radii],
+                    profile="pchip through measured planes" if self.points else "sphere through center and edge",
+                    profile_r_mm=list(r_n), profile_lens_um=list(z_n),
+                    point_r_mm=[stage_ref_point_r_mm(self.center, self.edge, p)[0] for p in self.points],
+                    circle_fit=None if fit is None else dict(radius_mm=fit[0], apex_r_mm=fit[1],
+                                                             residuals_um=list(fit[2])),
+                    lens_pred_um=[self.lens_pred_um(r) for r in radii],
                     stage_preload_um=STAGE_PRELOAD_UM, lens_preload_um=LENS_PRELOAD_UM,
                     created=datetime.now().isoformat(timespec="seconds"),
                     trials=[asdict(t) for t in self.trials()])
@@ -220,7 +233,7 @@ def run_experiment(
             if stop.is_set():
                 break
             on_status(f"Trial {t.index + 1}/{len(trials)}: block {t.block}, R = {t.r_mm:.2f} mm, {t.kind}")
-            z_pred = stage_ref_lens_um(cfg.center, cfg.edge, t.r_mm)
+            z_pred = cfg.lens_pred_um(t.r_mm)
             if r_now != t.r_mm:
                 # lens back first: a deep lens position at the edge is inside the phantom at the apex
                 z_safe = min(float(dev.lens.get_position()), z_pred - cfg.half_window_um)
