@@ -45,16 +45,22 @@ class ExperimentStep:
     loop: int                   # 1-based (loop, or pair for repeat runs)
     r_mm: Optional[float]       # target radius; None for repeat runs (no eye tracking)
     direction: str              # "fwd" | "bwd"
+    speed_um_s: Optional[float] = None   # None: the run's single speed
 
 
-def build_experiment_steps(radii_mm, n_loops: int) -> list[ExperimentStep]:
+def build_experiment_steps(radii_mm, n_loops: int, speeds_um_s=None) -> list[ExperimentStep]:
     """Each loop: forward slews at radii in order, then backward slews at the
-    radii in reverse order (the outermost radius gets fwd then bwd)."""
+    radii in reverse order (the outermost radius gets fwd then bwd).
+    With speeds, every radius and direction gets one slew per speed, back to back; the speed order
+    flips every loop so slow drifts hit all speeds alike."""
     radii = [float(r) for r in radii_mm]
     steps = []
     for k in range(1, int(n_loops) + 1):
-        steps += [ExperimentStep(k, r, "fwd") for r in radii]
-        steps += [ExperimentStep(k, r, "bwd") for r in reversed(radii)]
+        vs = [None] if not speeds_um_s else [float(v) for v in speeds_um_s]
+        if k % 2 == 0:
+            vs = vs[::-1]
+        steps += [ExperimentStep(k, r, "fwd", v) for r in radii for v in vs]
+        steps += [ExperimentStep(k, r, "bwd", v) for r in reversed(radii) for v in vs]
     return steps
 
 

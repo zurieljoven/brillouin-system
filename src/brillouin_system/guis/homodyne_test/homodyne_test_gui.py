@@ -110,6 +110,7 @@ class FindSettings:
 
 
 SCOPE_CHUNK_S = 30.0
+MAX_EXP_SPEED_UM_S = 2000.0
 
 
 class _Cancelled(Exception):
@@ -1158,6 +1159,13 @@ class HomodyneTestWindow(QWidget):
         self.exp_xy_moves = QSpinBox()
         self.exp_xy_moves.setRange(1, 10)
         self.exp_xy_moves.setValue(3)
+        self.exp_finder = QCheckBox("Live finder (stop past the plane) instead of full slews")
+        self.exp_finder.setChecked(True)
+        self.exp_speeds = QLineEdit("400, 800")
+        self.exp_speeds.setToolTip("um/s, comma separated. Each radius and direction gets one slew per speed. "
+                                   "Empty: the Speed of the slew box.")
+        self.exp_n_sigma = _dspin(1.0, 1000.0, 20.0, 1.0, 1, " sigma")
+        self.exp_stop_after = _dspin(10.0, 2000.0, 150.0, 10.0, 0, " um")
         self.exp_open_shutter = QCheckBox("Open sample shutter at start")
         self.exp_open_shutter.setChecked(True)
         self.exp_close_shutter = QCheckBox("Close all shutters when done")
@@ -1169,6 +1177,10 @@ class HomodyneTestWindow(QWidget):
         for wdg in (self.exp_r0, self.exp_r1, self.exp_dr, self.exp_fwd_range, self.exp_bwd_range):
             wdg.valueChanged.connect(self._exp_update_info)
         self.exp_loops.valueChanged.connect(self._exp_update_info)
+        self.exp_speeds.textChanged.connect(self._exp_update_info)
+        self.exp_finder.toggled.connect(self._exp_update_info)
+        for wdg in (self.exp_stop_after, self.exp_fwd_backoff, self.exp_bwd_backoff):
+            wdg.valueChanged.connect(self._exp_update_info)
         self.speed.valueChanged.connect(self._exp_update_info)
         f.addRow("phi:", self.exp_phi)
         f.addRow("Δc:", self.exp_dc)
@@ -1182,6 +1194,10 @@ class HomodyneTestWindow(QWidget):
         f.addRow("Bwd range:", self.exp_bwd_range)
         f.addRow("XY tolerance:", self.exp_xy_tol)
         f.addRow("Max XY moves:", self.exp_xy_moves)
+        f.addRow("Speeds:", self.exp_speeds)
+        f.addRow(self.exp_finder)
+        f.addRow("Finder threshold:", self.exp_n_sigma)
+        f.addRow("Finder stop after:", self.exp_stop_after)
         f.addRow(self.exp_open_shutter)
         f.addRow(self.exp_close_shutter)
         f.addRow(self.exp_info)
@@ -1604,7 +1620,7 @@ class HomodyneTestWindow(QWidget):
     EXP_LOG_FIELDS = ["step", "loop", "r_target_mm", "phi_target_deg", "direction", "file", "status",
                       "laser_x_mm", "laser_y_mm", "xy_err_mm", "xy_moves", "dc_mm", "lens_start_um",
                       "stage_x_um", "stage_y_um", "stage_z_um", "lens_pred_um", "peak_z_um", "peak_snr",
-                      "finder_found", "finder_z_um", "finder_peak", "finder_stop_z_um", "time"]
+                      "finder_found", "finder_z_um", "finder_peak", "finder_stop_z_um", "speed_um_s", "time"]
 
     def _exp_plan(self) -> dict:
         return {
@@ -1619,7 +1635,23 @@ class HomodyneTestWindow(QWidget):
             "speed_um_s": self.speed.value(),
             "xy_tol_mm": self.exp_xy_tol.value(),
             "max_xy_moves": self.exp_xy_moves.value(),
+            "speeds_um_s": self._exp_speeds(),
+            "use_finder": self.exp_finder.isChecked(),
+            "finder_n_sigma": self.exp_n_sigma.value(),
+            "finder_stop_after_um": self.exp_stop_after.value(),
         }
+
+    def _exp_speeds(self) -> list[float]:
+        txt = self.exp_speeds.text().replace(";", ",")
+        try:
+            vs = [float(x) for x in txt.split(",") if x.strip()]
+        except ValueError:
+            raise ValueError("Speeds: numbers in um/s, comma separated")
+        if not vs:
+            return [float(self.speed.value())]
+        if len(set(vs)) != len(vs) or any(not 0 < v <= MAX_EXP_SPEED_UM_S for v in vs):
+            raise ValueError(f"Speeds must be distinct and 0..{MAX_EXP_SPEED_UM_S:.0f} um/s")
+        return vs
 
     def _exp_update_info(self, *_):
         try:
@@ -1627,12 +1659,18 @@ class HomodyneTestWindow(QWidget):
         except ValueError as e:
             self.exp_info.setText(str(e))
             return
-        n_r = len(p["radii_mm"])
-        n = 2 * n_r * p["n_loops"]
+        n_r, vs = len(p["radii_mm"]), p["speeds_um_s"]
+        n = 2 * n_r * p["n_loops"] * len(vs)
+        if p["use_finder"]:   # travel to the plane (about the back-off) + stop-after, not the whole range
+            travel = [min(p["fwd_backoff_um"] + p["finder_stop_after_um"], p["fwd_range_um"]),
+                      min(p["bwd_backoff_um"] + p["finder_stop_after_um"], p["bwd_range_um"])]
+        else:
+            travel = [p["fwd_range_um"], p["bwd_range_um"]]
         # slew time + ~6 s per slew for moves, settling and the return move
-        t = p["n_loops"] * n_r * (p["fwd_range_um"] + p["bwd_range_um"]) / p["speed_um_s"] + 6.0 * n
-        self.exp_info.setText(f"{n} slews ({n_r} radii x 2 directions x {p['n_loops']} loops), "
-                              f"roughly {t / 60:.0f} min at {p['speed_um_s']:.0f} um/s.")
+        t = p["n_loops"] * n_r * sum(sum(travel) / v for v in vs) + 6.0 * n
+        what = "live finds" if p["use_finder"] else "slews"
+        self.exp_info.setText(f"{n} {what} ({n_r} radii x 2 directions x {len(vs)} speed(s) x {p['n_loops']} loops), "
+                              f"roughly {t / 60:.0f} min at " + ", ".join(f"{v:.0f}" for v in vs) + " um/s.")
 
     def _exp_start(self):
         if self._exp is not None:
@@ -1643,11 +1681,13 @@ class HomodyneTestWindow(QWidget):
         try:
             plan = self._exp_plan()
             self._daq_settings_validated()
-            fringe_band_hz(plan["speed_um_s"], self.wavelength.value(), float(self.fs.value()))
+            for v in plan["speeds_um_s"]:
+                fringe_band_hz(v, self.wavelength.value(), float(self.fs.value()))
         except ValueError as e:
             QMessageBox.warning(self, "Experiment", str(e))
             return
-        self._exp_begin(plan, build_experiment_steps(plan["radii_mm"], plan["n_loops"]), "experiment",
+        self._exp_begin(plan, build_experiment_steps(plan["radii_mm"], plan["n_loops"], plan["speeds_um_s"]),
+                        "experiment",
                         use_eye=True, description=self.exp_info.text(),
                         motion="The rig stage and eye lens will move.")
 
@@ -1873,6 +1913,7 @@ class HomodyneTestWindow(QWidget):
             "peak_snr": peak.snr if peak is not None else None,
             "finder_found": finder.get("finder_found"), "finder_z_um": finder.get("finder_z_um"),
             "finder_peak": finder.get("finder_peak"), "finder_stop_z_um": finder.get("finder_stop_z_um"),
+            "speed_um_s": step.speed_um_s if step.speed_um_s is not None else e.plan.get("speed_um_s"),
             "time": datetime.now().isoformat(timespec="seconds"),
         }
         with open(e.run_dir / "run_log.csv", "a", newline="") as fh:
@@ -1889,7 +1930,8 @@ class HomodyneTestWindow(QWidget):
         e.xy_moves = 0
         e.snapshot = {}
         e.eye_wait_s = 0.0
-        word = "forward" if s.direction == "fwd" else "backward"
+        word = ("forward" if s.direction == "fwd" else "backward") + \
+            (f" at {s.speed_um_s:.0f} um/s" if s.speed_um_s is not None else "")
         if e.mode == "stage_ref":
             self._set_status(f"Stage-referenced step {e.i + 1}/{len(e.steps)}: loop {s.loop}, "
                              f"R = {s.r_mm:.2f} mm, {word}")
@@ -1978,15 +2020,16 @@ class HomodyneTestWindow(QWidget):
         else:
             backoff = p["fwd_backoff_um"] if fwd else p["bwd_backoff_um"]
             rng = p["fwd_range_um"] if fwd else p["bwd_range_um"]
+        speed = s.speed_um_s if s.speed_um_s is not None else p["speed_um_s"]
         settings = SlewSettings(
             backoff_um=backoff,
             range_um=rng,
-            speed_um_s=p["speed_um_s"],
+            speed_um_s=speed,
             reverse=not fwd,
             return_to_start=True,
         )
         meta = dict(self._base_meta(),
-                    expected_fringe_hz=fringe_frequency_hz(p["speed_um_s"], self.wavelength.value()),
+                    expected_fringe_hz=fringe_frequency_hz(speed, self.wavelength.value()),
                     experiment=e.run_dir.name, step=e.i + 1, loop=s.loop, scan_direction=s.direction,
                     **({"r_target_mm": s.r_mm, "phi_target_deg": p["phi_deg"],
                         "dc_target_mm": p["dc_target_mm"]} if e.use_eye else {}),
@@ -1999,6 +2042,11 @@ class HomodyneTestWindow(QWidget):
                 speed_um_s=p["speed_um_s"], max_distance_um=max(2.0 * half, half + stop_after + 50.0),
                 n_sigma=p["finder_n_sigma"], stop_after_um=stop_after)), meta)
             return
+        if e.mode == "eye" and p.get("use_finder"):   # in vivo: search the slew range, stop just past the plane
+            self._req_find.emit(self._daq_settings(), FindSettings(backoff_um=backoff, reverse=not fwd, params=HomodyneFinderParams(
+                speed_um_s=speed, max_distance_um=rng, n_sigma=p["finder_n_sigma"],
+                stop_after_um=p["finder_stop_after_um"])), meta)
+            return
         self._req_slew.emit(self._daq_settings(), settings, meta)
 
     def _exp_on_recording(self, rec: HomodyneRecording):
@@ -2006,8 +2054,9 @@ class HomodyneTestWindow(QWidget):
         s = e.steps[e.i]
         self._last_rec = rec
         self._last_path = None
-        name = (f"{e.i + 1:03d}_loop{s.loop}_r{s.r_mm:.2f}_{s.direction}.h5" if s.r_mm is not None
-                else f"{e.i + 1:03d}_pair{s.loop}_{s.direction}.h5")
+        v = f"_v{s.speed_um_s:.0f}" if s.speed_um_s is not None else ""
+        name = (f"{e.i + 1:03d}_loop{s.loop}_r{s.r_mm:.2f}_{s.direction}{v}.h5" if s.r_mm is not None
+                else f"{e.i + 1:03d}_pair{s.loop}_{s.direction}{v}.h5")
         try:
             self._last_path = save_recording(rec, e.run_dir / name)
             self._unsaved = False
