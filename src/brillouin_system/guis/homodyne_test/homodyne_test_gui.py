@@ -107,6 +107,7 @@ class FindSettings:
     backoff_um: float
     reverse: bool           # False: back off toward -z, search toward +z
     params: HomodyneFinderParams
+    start_um: Optional[float] = None   # absolute search start; None: start z - direction * backoff
 
 
 SCOPE_CHUNK_S = 30.0
@@ -129,6 +130,7 @@ class _ExperimentState:
     xy_moves: int = 0
     eye_wait_s: float = 0.0
     snapshot: dict = field(default_factory=dict)
+    last_fwd: Optional[tuple] = None   # (loop, r_mm, speed, finder z or None) of the latest forward find
     abort: bool = False
     n_ok: int = 0
     n_fail: int = 0
@@ -390,7 +392,7 @@ class HomodyneWorker(QObject):
             z0 = float(zaber.get_position())
             self.position.emit(z0)
             direction = -1.0 if s.reverse else 1.0
-            z_start = z0 - direction * s.backoff_um
+            z_start = z0 - direction * s.backoff_um if s.start_um is None else float(s.start_um)
             zaber.move_abs(z_start)
             if self._stop.is_set():
                 raise _Cancelled()
@@ -1153,7 +1155,9 @@ class HomodyneTestWindow(QWidget):
         self.exp_loops.setValue(5)
         self.exp_fwd_backoff = _dspin(0.0, MAX_RANGE_UM, 500.0, 50.0, 0, " um")
         self.exp_fwd_range = _dspin(1.0, MAX_RANGE_UM, 2500.0, 50.0, 0, " um")
-        self.exp_bwd_backoff = _dspin(0.0, MAX_RANGE_UM, 2000.0, 50.0, 0, " um")
+        self.exp_bwd_backoff = _dspin(0.0, MAX_RANGE_UM, 300.0, 50.0, 0, " um")
+        self.exp_bwd_backoff.setToolTip("Live finder: the backward find starts this far past the plane the forward find "
+                                        "just found (deeper, toward +z). Full slews: back-off from the lens start.")
         self.exp_bwd_range = _dspin(1.0, MAX_RANGE_UM, 2500.0, 50.0, 0, " um")
         self.exp_xy_tol = _dspin(0.001, 1.0, 0.05, 0.01, 3, " mm")
         self.exp_xy_moves = QSpinBox()
@@ -1664,10 +1668,11 @@ class HomodyneTestWindow(QWidget):
         if p["use_finder"]:   # travel to the plane (about the back-off) + stop-after, not the whole range
             travel = [min(p["fwd_backoff_um"] + p["finder_stop_after_um"], p["fwd_range_um"]),
                       min(p["bwd_backoff_um"] + p["finder_stop_after_um"], p["bwd_range_um"])]
+            n_move = n // 2          # the backward find follows its forward find without eye-tracker moves
         else:
-            travel = [p["fwd_range_um"], p["bwd_range_um"]]
-        # slew time + ~6 s per slew for moves, settling and the return move
-        t = p["n_loops"] * n_r * sum(sum(travel) / v for v in vs) + 6.0 * n
+            n_move = n
+        # slew time + ~4 s per slew for settling and the return move, + ~4 s per eye-tracker positioning
+        t = p["n_loops"] * n_r * sum(sum(travel) / v for v in vs) + 4.0 * n + 4.0 * n_move
         what = "live finds" if p["use_finder"] else "slews"
         self.exp_info.setText(f"{n} {what} ({n_r} radii x 2 directions x {len(vs)} speed(s) x {p['n_loops']} loops), "
                               f"roughly {t / 60:.0f} min at " + ", ".join(f"{v:.0f}" for v in vs) + " um/s.")
@@ -1686,7 +1691,8 @@ class HomodyneTestWindow(QWidget):
         except ValueError as e:
             QMessageBox.warning(self, "Experiment", str(e))
             return
-        self._exp_begin(plan, build_experiment_steps(plan["radii_mm"], plan["n_loops"], plan["speeds_um_s"]),
+        self._exp_begin(plan, build_experiment_steps(plan["radii_mm"], plan["n_loops"], plan["speeds_um_s"],
+                                                     paired=plan["use_finder"]),
                         "experiment",
                         use_eye=True, description=self.exp_info.text(),
                         motion="The rig stage and eye lens will move.")
@@ -1941,6 +1947,11 @@ class HomodyneTestWindow(QWidget):
             self._set_status(f"Repeat slew {e.i + 1}/{len(e.steps)}: pair {s.loop}, {word}")
             self._exp_slew(None)
             return
+        if e.plan.get("use_finder") and s.direction == "bwd":
+            # straight after its forward find: no eye-tracker moves, start just past that plane
+            self._set_status(f"Experiment step {e.i + 1}/{len(e.steps)}: loop {s.loop}, R = {s.r_mm:.2f} mm, {word}")
+            self._exp_with_eye(self._exp_slew, need_dc=False)
+            return
         # mirror the targets in the manual fields (and the map's target marker)
         self.r_mm.setValue(s.r_mm)
         self.phi_deg.setValue(e.plan["phi_deg"])
@@ -2043,9 +2054,18 @@ class HomodyneTestWindow(QWidget):
                 n_sigma=p["finder_n_sigma"], stop_after_um=stop_after)), meta)
             return
         if e.mode == "eye" and p.get("use_finder"):   # in vivo: search the slew range, stop just past the plane
-            self._req_find.emit(self._daq_settings(), FindSettings(backoff_um=backoff, reverse=not fwd, params=HomodyneFinderParams(
-                speed_um_s=speed, max_distance_um=rng, n_sigma=p["finder_n_sigma"],
-                stop_after_um=p["finder_stop_after_um"])), meta)
+            start = None
+            if not fwd:
+                lf = e.last_fwd
+                anchor = lf[3] if lf is not None and lf[:3] == (s.loop, s.r_mm, s.speed_um_s) else None
+                if anchor is not None:
+                    start = float(anchor) + p["bwd_backoff_um"]
+                meta.update(bwd_anchor="fwd_plane" if anchor is not None else "lens_start",
+                            bwd_anchor_z_um=anchor, bwd_start_um=start)
+            self._req_find.emit(self._daq_settings(), FindSettings(
+                backoff_um=backoff, reverse=not fwd, start_um=start, params=HomodyneFinderParams(
+                    speed_um_s=speed, max_distance_um=rng, n_sigma=p["finder_n_sigma"],
+                    stop_after_um=p["finder_stop_after_um"])), meta)
             return
         self._req_slew.emit(self._daq_settings(), settings, meta)
 
@@ -2071,6 +2091,9 @@ class HomodyneTestWindow(QWidget):
         self.peak_label.setText(f"Last slew peak: z = {self._last_peak_z:.2f} um"
                                 if self._last_peak_z is not None else "Last slew peak: none found")
         self._exp_log(s, status, name, self._shown_peak, rec.meta)
+        if s.direction == "fwd":
+            e.last_fwd = (s.loop, s.r_mm, s.speed_um_s,
+                          rec.meta.get("finder_z_um") if rec.meta.get("finder_found") else None)
         if rec.meta.get("stopped_early"):
             e.abort = True
         e.i += 1
