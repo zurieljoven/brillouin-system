@@ -30,6 +30,7 @@ from brillouin_system.my_dataclasses.request_axial_step_scan import RequestAxial
 from brillouin_system.my_dataclasses.request_sweep_scan import RequestSweepScan
 from brillouin_system.my_dataclasses.sweep_cycle import SweepCycle
 from brillouin_system.scan_managers.ni_reflection_finder4 import ReflectionResult
+from brillouin_system.scan_managers.validation_recorder import SweepAttempt
 
 log = get_logger(__name__)
 
@@ -183,9 +184,18 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
     the plain finder is intentionally NOT applied — the sweep scan's
     target_depth_um replaces it.
     """
+    # Every find and the outcome of this attempt, for validation and failure statistics (failed attempts are
+    # never registered as scans). backend.last_sweep_attempt is read after the scan returns.
+    attempt = SweepAttempt(scan_id=str(request.id))
+    backend.last_sweep_attempt = attempt
+
+    def _fail(reason: str) -> bool:
+        attempt.success, attempt.reason = False, reason
+        return False
+
     if backend.is_reference_mode:
         log.info("[Sweep Scan] System is in Reference Mode - Change to Sample Mode.")
-        return False
+        return _fail("reference mode")
 
     sw = backend.sweep_scan_config
     lens_x0 = backend.zaber_eye_lens.get_position()
@@ -225,7 +235,7 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
         log.warning("[Sweep Scan] Timed sweep requires max_time_s > 0 - "
                     "aborting.")
         backend.move_and_update_gui_zaber_eye_lens_abs(lens_x0)
-        return False
+        return _fail("timed sweep without max_time_s")
 
     if timed:
         log.info(f"[Sweep Scan] Starting TIMED: budget {max_time_s:.1f} s, "
@@ -242,10 +252,11 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
 
     # Initial full-distance find (normal finder settings) to bootstrap.
     r0: ReflectionResult = backend.find_reflection_plane(is_go_forwards=True)
+    attempt.finds.append(("bootstrap", r0))
     if not r0.found:
         log.info("[Sweep Scan] Initial reflection find failed - aborting.")
         backend.move_and_update_gui_zaber_eye_lens_abs(lens_x0)
-        return False
+        return _fail("bootstrap find failed")
     plane_est = r0.event_z_um
     # Amplitude reference for the in-crossings. The out-crossing of each
     # cycle is instead judged against that cycle's own in-crossing, so a
@@ -286,7 +297,7 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
             log.info(f"[Sweep Scan] Cancelled during cycle {k + 1}. "
                      f"Returning lens to starting position.")
             backend.move_and_update_gui_zaber_eye_lens_abs(lens_x0)
-            return False
+            return _fail("cancelled")
 
         log.info(f"[Sweep Scan] Cycle {k + 1}"
                  f"{'' if timed else f'/{sw.n_repeats}'}")
@@ -294,6 +305,7 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
         # Park outside the current plane estimate and search inward.
         backend.zaber_eye_lens.move_abs(plane_est - sw.approach_um)
         r_in: ReflectionResult = backend.find_reflection_plane(is_go_forwards=True)
+        attempt.finds.append((f"c{k:02d}_in", r_in))
         in_ok, in_why = _accept_crossing(
             r_in,
             reference_z_um=plane_est,
@@ -350,6 +362,7 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
                 # only ~1 s old, so both gates can be tight.
                 backend.zaber_eye_lens.move_abs(plane_est + sw.approach_um)
                 r_out = backend.find_reflection_plane(is_go_forwards=False)
+                attempt.finds.append((f"c{k:02d}_out", r_out))
                 out_ok, out_why = _accept_crossing(
                     r_out,
                     reference_z_um=r_in.event_z_um,
@@ -393,6 +406,7 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
     backend.move_and_update_gui_zaber_eye_lens_abs(lens_x0)
 
     n_frames = len(measurements)
+    attempt.n_frames = n_frames
     n_pairs = sum(1 for c in cycles
                   if c.measurement_index is not None
                   and c.reflection_out is not None and c.reflection_out.found)
@@ -407,7 +421,7 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
     if n_frames == 0:
         log.info("[Sweep Scan] No frames acquired - not saving; treating as a "
                  "failed scan.")
-        return False
+        return _fail("no frames (no valid in-crossing)")
 
     # Motion quality gate (predefined measurements). The eye must have held
     # still for at least one measured cycle: |out-crossing z - in-crossing z|
@@ -416,6 +430,7 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
     motion_limit_um = getattr(request, "motion_limit_um", None)
     if motion_limit_um and motion_limit_um > 0:
         deltas = cycle_motion_deltas(cycles)
+        attempt.best_motion_um = min(deltas) if deltas else None
         if not passes_motion_limit(deltas, motion_limit_um):
             best = min(deltas) if deltas else None
             best_txt = f"{best:.1f} µm" if best is not None else "no in/out pair"
@@ -423,7 +438,7 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
                      f"{motion_limit_um:.1f} µm (best {best_txt} over "
                      f"{len(deltas)} in/out pair(s)). Not saving; treating as a "
                      f"failed scan.")
-            return False
+            return _fail(f"motion gate (best {best_txt})")
         log.info(f"[Sweep Scan] Motion gate passed: best "
                  f"{min(deltas):.1f} µm < {motion_limit_um:.1f} µm.")
 
@@ -442,6 +457,7 @@ def take_sweep_scan(backend, request: RequestSweepScan) -> bool:
         scanning_config=backend.axial_scan_config,
     )
     backend.register_axial_scan(axial_scan)
+    attempt.success, attempt.scan = True, axial_scan
 
     if ended_early:
         # Stopped before running every planned cycle - either a timed sweep

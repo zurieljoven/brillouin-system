@@ -47,6 +47,7 @@ class HiSignaller(QObject):
     measurement_result_ready = pyqtSignal(object)
     camera_shutter_state_changed = pyqtSignal(bool)
     calibration_finished = pyqtSignal()
+    calibration_failed = pyqtSignal()       # perform_calibration returned False (cancelled or an error)
     calibration_result_ready = pyqtSignal(object)
     send_update_stored_axial_scans = pyqtSignal(list)
     # Emitted at the START of a sweep scan (after any Move XY / Move Z), so the
@@ -424,6 +425,8 @@ class HiSignaller(QObject):
             is_sucess = scan_procedures.perform_calibration(self.backend)
             if is_sucess:
                 self.calibration_finished.emit()
+            else:
+                self.calibration_failed.emit()
         finally:
             self.update_system_state(new_state=old_state)
 

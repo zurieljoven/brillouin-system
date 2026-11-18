@@ -55,6 +55,7 @@ from brillouin_system.guis.homodyne_test.andor_view import (
 from brillouin_system.guis.plane_accuracy_test.axial_recording import save_axial
 from brillouin_system.guis.homodyne_test.spectrogram_view import SpectrogramView
 from brillouin_system.guis.homodyne_test.scope_view import ScopeView
+from brillouin_system.scan_managers.validation_recorder import save_eye_snapshot
 from brillouin_system.guis.homodyne_test.protocol_panel import ProtocolPanel
 from brillouin_system.guis.plane_accuracy_test.runner import Devices as PlaneAccuracyDevices, run_experiment
 from brillouin_system.guis.z_carrier_test.motion import SimAxisMover, ZaberAxisMover
@@ -1146,7 +1147,7 @@ class HomodyneTestWindow(QWidget):
         g = QGroupBox("Automated experiment (Move XYZ + slew per radius)")
         f = QFormLayout(g)
         self.exp_phi = _dspin(-3600.0, 3600.0, 0.0, 15.0, 1, " deg")
-        self.exp_dc = _dspin(-10.0, 10.0, -1.0, 0.1, 3, " mm")
+        self.exp_dc = _dspin(-10.0, 10.0, 1.0, 0.1, 3, " mm")   # > 0: laser in front of the cornea
         self.exp_r0 = _dspin(0.0, 10.0, 0.0, 0.5, 2, " mm")
         self.exp_r1 = _dspin(0.0, 10.0, 4.0, 0.5, 2, " mm")
         self.exp_dr = _dspin(0.01, 10.0, 0.5, 0.1, 2, " mm")
@@ -1170,6 +1171,8 @@ class HomodyneTestWindow(QWidget):
                                    "Empty: the Speed of the slew box.")
         self.exp_n_sigma = _dspin(1.0, 1000.0, 20.0, 1.0, 1, " sigma")
         self.exp_stop_after = _dspin(10.0, 2000.0, 150.0, 10.0, 0, " um")
+        self.exp_save_eye = QCheckBox("Save eye-tracker frames before and after each find")
+        self.exp_save_eye.setChecked(True)
         self.exp_open_shutter = QCheckBox("Open sample shutter at start")
         self.exp_open_shutter.setChecked(True)
         self.exp_close_shutter = QCheckBox("Close all shutters when done")
@@ -1202,6 +1205,7 @@ class HomodyneTestWindow(QWidget):
         f.addRow(self.exp_finder)
         f.addRow("Finder threshold:", self.exp_n_sigma)
         f.addRow("Finder stop after:", self.exp_stop_after)
+        f.addRow(self.exp_save_eye)
         f.addRow(self.exp_open_shutter)
         f.addRow(self.exp_close_shutter)
         f.addRow(self.exp_info)
@@ -2016,10 +2020,26 @@ class HomodyneTestWindow(QWidget):
         elif e.phase == "sr_z":
             QTimer.singleShot(int(1000 * SETTLE_S), lambda: self._exp_slew(None))
 
+    def _exp_save_eye(self, tag: str, res) -> Optional[str]:
+        """Save the eye-tracker frames and result behind a find, for checking the registration later.
+        eye/<step>_<tag>.npz: left, right (uint8), time_stamp, laser_position, delta_c, pupil3d (json)."""
+        e = self._exp
+        if e is None or res is None or not self.exp_save_eye.isChecked():
+            return None
+        try:
+            name = f"{e.i + 1:03d}_{tag}.npz"
+            save_eye_snapshot(e.run_dir / "eye" / name, res,
+                              lens_um=float(self._lens_um) if self._lens_um is not None else None)
+            return name
+        except Exception as ex:
+            self._set_status(f"Eye frames not saved: {ex}")
+            return None
+
     def _exp_slew(self, res):
         e = self._exp
         s = e.steps[e.i]
         p = e.plan
+        e.snapshot["eye_file"] = self._exp_save_eye("pre", res)
         e.snapshot["lens_start_um"] = self._lens_um
         if res is not None:   # None: repeat run, no eye tracking
             lp = res.laser_position
@@ -2091,6 +2111,8 @@ class HomodyneTestWindow(QWidget):
         self.peak_label.setText(f"Last slew peak: z = {self._last_peak_z:.2f} um"
                                 if self._last_peak_z is not None else "Last slew peak: none found")
         self._exp_log(s, status, name, self._shown_peak, rec.meta)
+        if e.use_eye and self.eye_panel is not None:
+            self._exp_save_eye("post", self.eye_panel.latest_result(max_age_s=1.0))
         if s.direction == "fwd":
             e.last_fwd = (s.loop, s.r_mm, s.speed_um_s,
                           rec.meta.get("finder_z_um") if rec.meta.get("finder_found") else None)

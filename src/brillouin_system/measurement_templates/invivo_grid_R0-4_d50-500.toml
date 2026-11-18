@@ -1,0 +1,375 @@
+# In vivo grid: R = 0, 0.5, ..., 4.0 mm on phi = 0 x depth = 50, 100, ..., 500 um below the anterior surface.
+# 90 points, one motion-gated sweep scan each (|out - in| < 100 um for at least one cycle).
+# Meant for "Auto-run plan" (random order, retried until every point passes); also usable step by step.
+#
+# delta_c_mm = +1.0 (the usual setting): the laser focus starts ~1 mm OUTSIDE the cornea, so the bootstrap forward
+# find starts well clear of the surface. On 2026-11-18 the planes sat ~0.7-0.8 mm further in than delta_c predicted,
+# so expect the surface ~1.6-1.8 mm ahead: keep the axial homodyne max distance at 2500 um.
+
+[defaults]
+mode = "timed"
+max_time_s = 10.0
+replicates = 1
+phi_deg = 0.0
+delta_c_mm = 1.0
+motion_limit_um = 100.0
+
+[[step]]
+R_mm = 0.0
+depth_um = 50
+
+[[step]]
+R_mm = 0.0
+depth_um = 100
+
+[[step]]
+R_mm = 0.0
+depth_um = 150
+
+[[step]]
+R_mm = 0.0
+depth_um = 200
+
+[[step]]
+R_mm = 0.0
+depth_um = 250
+
+[[step]]
+R_mm = 0.0
+depth_um = 300
+
+[[step]]
+R_mm = 0.0
+depth_um = 350
+
+[[step]]
+R_mm = 0.0
+depth_um = 400
+
+[[step]]
+R_mm = 0.0
+depth_um = 450
+
+[[step]]
+R_mm = 0.0
+depth_um = 500
+
+[[step]]
+R_mm = 0.5
+depth_um = 50
+
+[[step]]
+R_mm = 0.5
+depth_um = 100
+
+[[step]]
+R_mm = 0.5
+depth_um = 150
+
+[[step]]
+R_mm = 0.5
+depth_um = 200
+
+[[step]]
+R_mm = 0.5
+depth_um = 250
+
+[[step]]
+R_mm = 0.5
+depth_um = 300
+
+[[step]]
+R_mm = 0.5
+depth_um = 350
+
+[[step]]
+R_mm = 0.5
+depth_um = 400
+
+[[step]]
+R_mm = 0.5
+depth_um = 450
+
+[[step]]
+R_mm = 0.5
+depth_um = 500
+
+[[step]]
+R_mm = 1.0
+depth_um = 50
+
+[[step]]
+R_mm = 1.0
+depth_um = 100
+
+[[step]]
+R_mm = 1.0
+depth_um = 150
+
+[[step]]
+R_mm = 1.0
+depth_um = 200
+
+[[step]]
+R_mm = 1.0
+depth_um = 250
+
+[[step]]
+R_mm = 1.0
+depth_um = 300
+
+[[step]]
+R_mm = 1.0
+depth_um = 350
+
+[[step]]
+R_mm = 1.0
+depth_um = 400
+
+[[step]]
+R_mm = 1.0
+depth_um = 450
+
+[[step]]
+R_mm = 1.0
+depth_um = 500
+
+[[step]]
+R_mm = 1.5
+depth_um = 50
+
+[[step]]
+R_mm = 1.5
+depth_um = 100
+
+[[step]]
+R_mm = 1.5
+depth_um = 150
+
+[[step]]
+R_mm = 1.5
+depth_um = 200
+
+[[step]]
+R_mm = 1.5
+depth_um = 250
+
+[[step]]
+R_mm = 1.5
+depth_um = 300
+
+[[step]]
+R_mm = 1.5
+depth_um = 350
+
+[[step]]
+R_mm = 1.5
+depth_um = 400
+
+[[step]]
+R_mm = 1.5
+depth_um = 450
+
+[[step]]
+R_mm = 1.5
+depth_um = 500
+
+[[step]]
+R_mm = 2.0
+depth_um = 50
+
+[[step]]
+R_mm = 2.0
+depth_um = 100
+
+[[step]]
+R_mm = 2.0
+depth_um = 150
+
+[[step]]
+R_mm = 2.0
+depth_um = 200
+
+[[step]]
+R_mm = 2.0
+depth_um = 250
+
+[[step]]
+R_mm = 2.0
+depth_um = 300
+
+[[step]]
+R_mm = 2.0
+depth_um = 350
+
+[[step]]
+R_mm = 2.0
+depth_um = 400
+
+[[step]]
+R_mm = 2.0
+depth_um = 450
+
+[[step]]
+R_mm = 2.0
+depth_um = 500
+
+[[step]]
+R_mm = 2.5
+depth_um = 50
+
+[[step]]
+R_mm = 2.5
+depth_um = 100
+
+[[step]]
+R_mm = 2.5
+depth_um = 150
+
+[[step]]
+R_mm = 2.5
+depth_um = 200
+
+[[step]]
+R_mm = 2.5
+depth_um = 250
+
+[[step]]
+R_mm = 2.5
+depth_um = 300
+
+[[step]]
+R_mm = 2.5
+depth_um = 350
+
+[[step]]
+R_mm = 2.5
+depth_um = 400
+
+[[step]]
+R_mm = 2.5
+depth_um = 450
+
+[[step]]
+R_mm = 2.5
+depth_um = 500
+
+[[step]]
+R_mm = 3.0
+depth_um = 50
+
+[[step]]
+R_mm = 3.0
+depth_um = 100
+
+[[step]]
+R_mm = 3.0
+depth_um = 150
+
+[[step]]
+R_mm = 3.0
+depth_um = 200
+
+[[step]]
+R_mm = 3.0
+depth_um = 250
+
+[[step]]
+R_mm = 3.0
+depth_um = 300
+
+[[step]]
+R_mm = 3.0
+depth_um = 350
+
+[[step]]
+R_mm = 3.0
+depth_um = 400
+
+[[step]]
+R_mm = 3.0
+depth_um = 450
+
+[[step]]
+R_mm = 3.0
+depth_um = 500
+
+[[step]]
+R_mm = 3.5
+depth_um = 50
+
+[[step]]
+R_mm = 3.5
+depth_um = 100
+
+[[step]]
+R_mm = 3.5
+depth_um = 150
+
+[[step]]
+R_mm = 3.5
+depth_um = 200
+
+[[step]]
+R_mm = 3.5
+depth_um = 250
+
+[[step]]
+R_mm = 3.5
+depth_um = 300
+
+[[step]]
+R_mm = 3.5
+depth_um = 350
+
+[[step]]
+R_mm = 3.5
+depth_um = 400
+
+[[step]]
+R_mm = 3.5
+depth_um = 450
+
+[[step]]
+R_mm = 3.5
+depth_um = 500
+
+[[step]]
+R_mm = 4.0
+depth_um = 50
+
+[[step]]
+R_mm = 4.0
+depth_um = 100
+
+[[step]]
+R_mm = 4.0
+depth_um = 150
+
+[[step]]
+R_mm = 4.0
+depth_um = 200
+
+[[step]]
+R_mm = 4.0
+depth_um = 250
+
+[[step]]
+R_mm = 4.0
+depth_um = 300
+
+[[step]]
+R_mm = 4.0
+depth_um = 350
+
+[[step]]
+R_mm = 4.0
+depth_um = 400
+
+[[step]]
+R_mm = 4.0
+depth_um = 450
+
+[[step]]
+R_mm = 4.0
+depth_um = 500

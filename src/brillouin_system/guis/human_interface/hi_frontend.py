@@ -462,6 +462,10 @@ class HiFrontend(QWidget):
         axial_column = QVBoxLayout()
         axial_column.addWidget(self.create_take_axial_scan_group())
         axial_column.addWidget(self.create_predefined_measurement_group())
+        # Unattended run of the loaded plan (sequencing in plan_autorun_panel, records in plan_autorun).
+        from brillouin_system.guis.human_interface.plan_autorun_panel import PlanAutoRunPanel
+        self.plan_autorun_panel = PlanAutoRunPanel(self)
+        axial_column.addWidget(self.plan_autorun_panel)
 
         zaber_movement_and_scan_layout.addLayout(axial_column)
         middle_column_layout.addLayout(zaber_movement_and_scan_layout)
@@ -1080,10 +1084,26 @@ class HiFrontend(QWidget):
                         "to finish before starting another.")
             return
 
+        if getattr(self, "plan_autorun_panel", None) is not None and self.plan_autorun_panel.active:
+            log.warning("[Predefined] The auto-run is active; stop it first.")
+            return
+
         step = self._predef_steps[self._predef_index]
-        step_id = step.id
         log.info(f"[Predefined] Running step {self._predef_index + 1}/"
-                 f"{len(self._predef_steps)} | ID: {step_id}")
+                 f"{len(self._predef_steps)} | ID: {step.id}")
+        # Mark the run active so on_sweep_scan_finished advances the list
+        # only if this sweep actually completes.
+        self._predef_run_active = True
+        if not self.run_plan_step(step):
+            # The request never went out; clear the flag so it can be retried
+            # (no completion signal will arrive to clear it otherwise).
+            self._predef_run_active = False
+
+    def run_plan_step(self, step: PlanStep) -> bool:
+        """Move XYZ to the step's R / phi / Δc, push its sweep settings and
+        request the motion-gated sweep scan with the step's ID. True if the
+        request went out. Shared by the predefined list and the auto-run."""
+        step_id = step.id
 
         # 1) Position: Move XYZ using this step's R / phi / Δc.
         self.xy_r_input.setText(f"{step.R_mm:g}")
@@ -1110,18 +1130,12 @@ class HiFrontend(QWidget):
         self.update_sweep_scan_config_requested.emit(cfg)
 
         # 3) Name the ID and take the sweep scan (reuses take_sweep_scan()).
-        #    Mark the run active so on_sweep_scan_finished advances the list
-        #    only if this sweep actually completes.
-        self._predef_run_active = True
         self.axial_id_input.setText(step_id)
         # Use this step's resolved max time for the budget / auto end-scan-early
         # timer, run timed or fixed as the plan specified, and carry the motion
         # limit so the backend drops the scan if the eye moved too much.
-        if not self.take_sweep_scan(max_time_s=cfg.max_time_s, timed=timed,
-                                    motion_limit_um=step.motion_limit_um):
-            # The request never went out; clear the flag so it can be retried
-            # (no completion signal will arrive to clear it otherwise).
-            self._predef_run_active = False
+        return self.take_sweep_scan(max_time_s=cfg.max_time_s, timed=timed,
+                                    motion_limit_um=step.motion_limit_um)
 
     def on_check_predefined_progress(self):
         """Ask the backend to score the current plan against the saved scans.
@@ -1616,6 +1630,8 @@ class HiFrontend(QWidget):
 
     def on_stop_clicked(self):
         log.info("[Brillouin Viewer] STOP clicked.")
+        if getattr(self, "plan_autorun_panel", None) is not None:
+            self.plan_autorun_panel.abort()
 
         # --- EMERGENCY: close shutters in a separate thread immediately ---
         try:
