@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import asdict, dataclass
+from typing import Optional
 
 WAVELENGTH_UM = 0.78024
 MAX_SLEW_HALF_UM = 400.0
@@ -79,16 +80,34 @@ class ProtocolConfig:
     andor_step_um: float = 2.0
     exposure_s: float = 0.1
     gain: int = 0                   # Andor EM gain
-    pd_gain_db: int = 70            # photodiode gain switch, recorded only
+    pd_gain_db: Optional[int] = 70  # photodiode gain switch, recorded only (single-gain GUIs)
+    pd_gain_h_db: Optional[int] = None   # per-channel photodiode gains, recorded only (homodyne test GUI)
+    pd_gain_v_db: Optional[int] = None
     fp_mod_hz: float = 3396.5       # FP lock modulation frequency, recorded only
     close_shutters_at_end: bool = True
+    lens_above_nyquist: bool = False    # also slew the lens at speeds whose stage fringe would alias (speed sweep)
 
     def combos(self) -> list[tuple[float, float]]:
         """(speed, sample rate) pairs that are slewed: the stage-Z fringe must fit below 0.9 x Nyquist."""
         return [(float(v), float(fs)) for v in self.speeds_um_s for fs in self.sample_rates_hz
                 if v <= min(MAX_STAGE_SPEED_UM_S, max_fringe_speed_um_s(fs))]
 
+    def slews(self) -> list[tuple[str, float, float]]:
+        """(axis, speed, sample rate) slewed. Stage only below its fringe Nyquist limit; with lens_above_nyquist the
+        lens runs every speed up to MAX_LENS_SPEED_UM_S (its fringe is vibration, not 2v/lambda)."""
+        ok = set(self.combos())
+        out = []
+        for v in self.speeds_um_s:
+            for fs in self.sample_rates_hz:
+                c = (float(v), float(fs))
+                if c in ok or (self.lens_above_nyquist and v <= MAX_LENS_SPEED_UM_S):
+                    out.append(("lens", *c))
+                if c in ok:
+                    out.append(("stage", *c))
+        return out
+
     def skipped(self) -> list[tuple[float, float]]:
+        """(speed, rate) pairs whose stage slews are skipped."""
         ok = set(self.combos())
         return [(float(v), float(fs)) for v in self.speeds_um_s for fs in self.sample_rates_hz
                 if (float(v), float(fs)) not in ok]
@@ -114,8 +133,10 @@ class ProtocolConfig:
             raise ValueError("The Andor step must be positive and no larger than the sweep half-width")
         if self.stationary_s <= 0 or self.exposure_s <= 0:
             raise ValueError("Durations must be positive")
-        good = {v for v, _ in self.combos()}
+        good = {v for _, v, _ in self.slews()}
         top = min(MAX_STAGE_SPEED_UM_S, max_fringe_speed_um_s(max(self.sample_rates_hz)))
+        if self.lens_above_nyquist:
+            top = MAX_LENS_SPEED_UM_S
         for v in self.speeds_um_s:
             if v <= 0 or v not in good:
                 raise ValueError(f"Speed {v:.0f} um/s: must be 0..{top:.0f} um/s at the highest sample rate (stage "
@@ -136,7 +157,7 @@ class ProtocolConfig:
         for b in range(1, self.n_blocks + 1):
             cells = [dict(kind="stationary", fs_hz=float(fs)) for fs in self.sample_rates_hz]
             cells += [dict(kind="slew", axis=ax, direction=d, speed_um_s=v, fs_hz=fs)
-                      for v, fs in self.combos() for ax in AXES for d in (1, -1)]
+                      for ax, v, fs in self.slews() for d in (1, -1)]
             rng.shuffle(cells)
             for c in cells:
                 add(block=b, **c)
@@ -163,5 +184,6 @@ class ProtocolConfig:
         d["speeds_um_s"] = list(self.speeds_um_s)
         d["sample_rates_hz"] = list(self.sample_rates_hz)
         d["slewed_combos"] = [list(c) for c in self.combos()]
+        d["slews"] = [list(c) for c in self.slews()]
         d["fp_alias_hz"] = {f"{fs:.0f}": alias_hz(self.fp_mod_hz, fs) for fs in self.sample_rates_hz}
         return d

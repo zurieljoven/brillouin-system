@@ -78,9 +78,10 @@ class ProtocolPanel(QWidget):
         self.g_sample = QLineEdit("glass")
         self.g_blocks = _ispin(1, 50, 5)
         self.g_seed = _ispin(0, 10_000, 0)
-        self.g_speeds = QLineEdit("400")
-        self.g_speeds.setToolTip("um/s, comma separated. Each speed is slewed on both axes, fwd and bwd.")
-        self.g_rates = QLineEdit("5000")
+        self.g_speeds = QLineEdit("400, 800, 1200, 1600, 2000")
+        self.g_speeds.setToolTip("um/s, comma separated, up to 2000. The lens runs every speed, fwd and bwd; the stage only "
+                                 "where its 2v/lambda fringe stays below Nyquist.")
+        self.g_rates = QLineEdit("5000, 10000")
         self.g_rates.setToolTip("S/s per channel, comma separated (above 5000 only H is recorded).")
         self.g_stat = _dspin(0.5, 120.0, 10.0, 1.0, 1, " s")
         self.g_half = _dspin(10.0, 400.0, 200.0, 25.0, 0, " um")
@@ -88,7 +89,6 @@ class ProtocolPanel(QWidget):
         self.g_andor_step = _dspin(0.5, 50.0, 2.0, 0.5, 1, " um")
         self.g_exposure = _dspin(0.001, 10.0, 0.1, 0.05, 3, " s")
         self.g_gain = _ispin(0, 300, 0)
-        self.g_pd_gain = _ispin(0, 70, 50)
         self.g_fp = _dspin(0.0, 1e5, 3396.5, 1.0, 1, " Hz")
         self.g_close = QCheckBox("Close all shutters when done")
         self.g_close.setChecked(True)
@@ -99,7 +99,7 @@ class ProtocolPanel(QWidget):
                        ("Speeds:", self.g_speeds), ("Sample rates:", self.g_rates), ("Stationary:", self.g_stat),
                        ("Slew ± start:", self.g_half), ("Andor ± start:", self.g_andor_half),
                        ("Andor step:", self.g_andor_step), ("Andor exposure:", self.g_exposure),
-                       ("Andor EM gain:", self.g_gain), ("PD gain (logged):", self.g_pd_gain),
+                       ("Andor EM gain:", self.g_gain),
                        ("FP mod (logged):", self.g_fp)):
             f.addRow(lbl, w)
         f.addRow(self.g_close)
@@ -174,8 +174,8 @@ class ProtocolPanel(QWidget):
             stationary_s=self.g_stat.value(), slew_half_um=self.g_half.value(),
             speeds_um_s=_floats(self.g_speeds.text()), sample_rates_hz=_floats(self.g_rates.text()),
             andor_half_um=self.g_andor_half.value(), andor_step_um=self.g_andor_step.value(),
-            exposure_s=self.g_exposure.value(), gain=self.g_gain.value(), pd_gain_db=self.g_pd_gain.value(),
-            fp_mod_hz=self.g_fp.value(), close_shutters_at_end=self.g_close.isChecked())
+            exposure_s=self.g_exposure.value(), gain=self.g_gain.value(), pd_gain_db=None,
+            fp_mod_hz=self.g_fp.value(), close_shutters_at_end=self.g_close.isChecked(), lens_above_nyquist=True)
         cfg.validate()
         return cfg
 
@@ -227,8 +227,11 @@ class ProtocolPanel(QWidget):
             cfg = self.glass_config()
             n = len(cfg.steps())
             skipped = cfg.skipped()
-            self.g_info.setText(f"{n} steps, about {_fmt_s(cfg.estimated_s())}."
-                                + (f" Skipped (stage fringe above Nyquist): {skipped}" if skipped else ""))
+            n_lens = sum(a == "lens" for a, _, _ in cfg.slews())
+            self.g_info.setText(f"{n} steps, about {_fmt_s(cfg.estimated_s())}. Per block: {2 * n_lens} lens slews, "
+                                f"{2 * (len(cfg.slews()) - n_lens)} stage slews."
+                                + (" Stage skipped (fringe above Nyquist): "
+                                   + ", ".join(f"{v:.0f} um/s at {fs:.0f}" for v, fs in skipped) if skipped else ""))
         except ValueError as e:
             self.g_info.setText(f"Invalid: {e}")
         c, e = self._center, self._edge

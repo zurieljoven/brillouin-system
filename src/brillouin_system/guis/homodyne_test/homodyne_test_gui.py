@@ -33,7 +33,7 @@ import csv
 import json
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -54,6 +54,7 @@ from brillouin_system.guis.homodyne_test.andor_view import (
 )
 from brillouin_system.guis.plane_accuracy_test.axial_recording import save_axial
 from brillouin_system.guis.homodyne_test.spectrogram_view import SpectrogramView
+from brillouin_system.guis.homodyne_test.scope_view import ScopeView
 from brillouin_system.guis.homodyne_test.protocol_panel import ProtocolPanel
 from brillouin_system.guis.plane_accuracy_test.runner import Devices as PlaneAccuracyDevices, run_experiment
 from brillouin_system.guis.z_carrier_test.motion import SimAxisMover, ZaberAxisMover
@@ -108,6 +109,9 @@ class FindSettings:
     params: HomodyneFinderParams
 
 
+SCOPE_CHUNK_S = 30.0
+
+
 class _Cancelled(Exception):
     pass
 
@@ -144,6 +148,8 @@ class HomodyneWorker(QObject):
     sweep_done = pyqtSignal(object)                 # AxialRecording
     protocol_result = pyqtSignal(object, object)    # log row (None for a re-centre sweep), recording
     protocol_done = pyqtSignal(str)
+    scope_data = pyqtSignal(object)                 # (n_ch, m) block of volts
+    scope_done = pyqtSignal(str)                    # error text, empty when stopped normally
 
     def __init__(self, daq, zaber, stage=None, use_dummy: bool = False):
         super().__init__()
@@ -354,6 +360,21 @@ class HomodyneWorker(QObject):
                 t0_perf=res.t0_perf, channels=tuple(res.channels), meta=meta))
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
+
+    @pyqtSlot(object)
+    def run_scope(self, daq_settings: DaqSettings):
+        """Stream the DAQ to the Scope tab until stopped. Consecutive SCOPE_CHUNK_S acquisitions, so there is a
+        short gap every SCOPE_CHUNK_S seconds while the task restarts. Nothing is recorded."""
+        self._stop.clear()
+        try:
+            self._apply(daq_settings)
+            self.status.emit("Scope running (STOP ends it) ...")
+            while not self._stop.is_set():
+                self.daq.acquire(SCOPE_CHUNK_S, stop_evt=self._stop, chunk_size=250,
+                                 on_data=lambda b: self.scope_data.emit(np.array(b, copy=True)))
+            self.scope_done.emit("")
+        except Exception as e:
+            self.scope_done.emit(f"{type(e).__name__}: {e}")
 
     @pyqtSlot(object, object, object)
     def run_find(self, daq_settings: DaqSettings, s: FindSettings, meta: dict):
@@ -610,6 +631,7 @@ class HomodyneTestWindow(QWidget):
     _req_sweep = pyqtSignal(str, float, int, float, float)
     _req_glass = pyqtSignal(object, object, object, object)
     _req_phantom = pyqtSignal(object, object, object, object)
+    _req_scope = pyqtSignal(object)
 
     def __init__(self, *, use_dummy: bool, zaber_port: str = "COM5", ni_device: str = "Dev1",
                  stage_port: str = "COM6", include_eye_tracking: bool = True,
@@ -619,6 +641,7 @@ class HomodyneTestWindow(QWidget):
         self.use_dummy = use_dummy
         self.ni_device = ni_device
         self._busy = False
+        self._scope_running = False
         self._last_rec: Optional[HomodyneRecording] = None
         self._last_path: Optional[Path] = None
         self._unsaved = False   # last acquisition not saved yet
@@ -686,6 +709,9 @@ class HomodyneTestWindow(QWidget):
             self._req_phantom.connect(self._worker.run_phantom_protocol)
             self._worker.protocol_result.connect(self._on_protocol_result)
             self._worker.protocol_done.connect(self._on_protocol_done)
+            self._req_scope.connect(self._worker.run_scope)
+            self._worker.scope_data.connect(self.scope_view.add_block)
+            self._worker.scope_done.connect(self._on_scope_done)
             self._thread.start()
             self._req_position.emit()
         self._set_busy(False)
@@ -823,6 +849,17 @@ class HomodyneTestWindow(QWidget):
         f.addRow("Terminal:", self.terminal)
         f.addRow("Range (+- V):", self.v_range)
         f.addRow("Sample rate:", self.fs)
+        self.pd_gain_h = QSpinBox()
+        self.pd_gain_v = QSpinBox()
+        for w in (self.pd_gain_h, self.pd_gain_v):
+            w.setRange(0, 70)
+            w.setSingleStep(10)
+            w.setValue(70)
+            w.setSuffix(" dB")
+            w.setToolTip("The photodiode gain switch setting. Only written into the files (pd_gain_h_db / "
+                         "pd_gain_v_db), nothing is changed. Set it every time you turn a gain knob.")
+        f.addRow("PD gain H (logged):", self.pd_gain_h)
+        f.addRow("PD gain V (logged):", self.pd_gain_v)
         cl.addWidget(g)
 
         # 1. Stationary
@@ -942,6 +979,10 @@ class HomodyneTestWindow(QWidget):
         self.tabs.addTab(data_tab, "Data")
         self.spec_view = SpectrogramView()
         self.tabs.addTab(self.spec_view, "Spectrograms")
+        self.scope_view = ScopeView()
+        self.scope_view.start_requested.connect(self._start_scope)
+        self.scope_view.stop_requested.connect(self._stop)
+        self.tabs.addTab(self.scope_view, "Scope")
         self.tabs.addTab(self._build_andor_tab(), "Andor")
         self.protocol_panel = ProtocolPanel()
         self.protocol_panel.start_glass.connect(self._start_glass_protocol)
@@ -1269,7 +1310,11 @@ class HomodyneTestWindow(QWidget):
             "effective_range_v": effective_range_v(self.terminal.currentText(),
                                                    float(self.v_range.currentText())),
             **asdict(self._daq_settings()),
+            **self._pd_gains(),
         }
+
+    def _pd_gains(self) -> dict:
+        return {"pd_gain_h_db": int(self.pd_gain_h.value()), "pd_gain_v_db": int(self.pd_gain_v.value())}
 
     def _band(self, fs: float, speed_um_s: Optional[float]) -> tuple[float, float]:
         if self.auto_band.isChecked():
@@ -1331,6 +1376,7 @@ class HomodyneTestWindow(QWidget):
             b.setEnabled(cam)
         self.live_btn.setEnabled(connected and self._andor_ok)
         proto = idle and has_stage and self._andor_ok
+        self.scope_view.set_state(can_start=idle, running=busy and self._scope_running)
         self.protocol_panel.set_enabled(proto, proto and self._center_ref is not None and self._edge_ref is not None,
                                         idle and has_stage)
 
@@ -2035,6 +2081,7 @@ class HomodyneTestWindow(QWidget):
         req.emit(self._daq_settings(), cfg, run_dir, self.shutters)
 
     def _start_glass_protocol(self, cfg):
+        cfg = replace(cfg, **self._pd_gains())
         self._protocol_start(
             "glass", cfg, self._req_glass,
             f"{len(cfg.steps())} steps (about {cfg.estimated_s() / 60:.0f} min). The lens must be parked on the "
@@ -2043,6 +2090,7 @@ class HomodyneTestWindow(QWidget):
             f"±{cfg.andor_half_um:.0f} um on both axes at the start and the end. The sample shutter opens.")
 
     def _start_phantom_protocol(self, cfg):
+        cfg = replace(cfg, **self._pd_gains())
         self._protocol_start(
             "phantom", cfg, self._req_phantom,
             f"{len(cfg.trials())} trials over {len(cfg.radii())} radii (about {cfg.estimated_s() / 60:.0f} min). "
@@ -2085,6 +2133,26 @@ class HomodyneTestWindow(QWidget):
         self._stop_live()
         self._set_busy(True)
         self._req_stationary.emit(self._daq_settings(), float(self.duration.value()), self._base_meta())
+
+    def _start_scope(self):
+        try:
+            self._daq_settings_validated()
+        except ValueError as e:
+            QMessageBox.warning(self, "DAQ settings", str(e))
+            return
+        self._stop_live()
+        d = self._daq_settings()
+        self._scope_running = True
+        self.scope_view.begin(d.sample_rate_hz, d.channels)
+        self._set_busy(True)
+        self._req_scope.emit(d)
+
+    @pyqtSlot(str)
+    def _on_scope_done(self, err: str):
+        self._scope_running = False
+        self.scope_view.end(f"Error: {err}" if err else "Stopped.")
+        self._set_busy(False)
+        self._set_status(f"Scope error: {err}" if err else "Scope stopped.")
 
     def _start_slew(self):
         if not self._confirm_discard_unsaved("record a new one"):

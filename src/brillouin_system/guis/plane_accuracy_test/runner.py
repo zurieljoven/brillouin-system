@@ -71,6 +71,8 @@ class RunConfig:
     gain: int = 0
     sample_rate_hz: float = 5000.0
     close_shutters_at_end: bool = True
+    pd_gain_h_db: Optional[int] = None   # photodiode gain switches, recorded only
+    pd_gain_v_db: Optional[int] = None
     points: tuple = ()          # measured intermediate planes (StageRef) on the center -> edge line; none = sphere
 
     def lens_pred_um(self, r_mm: float) -> float:
@@ -242,7 +244,8 @@ def run_experiment(
                 r_now = t.r_mm
             sx, sy, _ = dev.stage.get_position()
             meta = dict(experiment=run_dir.name, trial=t.index + 1, block=t.block, r_target_mm=t.r_mm, kind=t.kind,
-                        lens_pred_um=z_pred, stage_x_um=sx, stage_y_um=sy, seed=cfg.seed)
+                        lens_pred_um=z_pred, stage_x_um=sx, stage_y_um=sy, seed=cfg.seed,
+                        pd_gain_h_db=cfg.pd_gain_h_db, pd_gain_v_db=cfg.pd_gain_v_db)
             row = dict(trial=t.index + 1, block=t.block, r_mm=t.r_mm, kind=t.kind, stage_x_um=sx, stage_y_um=sy,
                        lens_pred_um=z_pred, t_perf=time.perf_counter(),
                        time=datetime.now().isoformat(timespec="seconds"), status="ok")

@@ -333,6 +333,7 @@ def run_protocol(rig: Rig, cfg: ProtocolConfig, run_dir: Path, stop: threading.E
             on_status(f"Step {s.index + 1}/{len(steps)} (block {s.block}): {label}")
             meta = dict(experiment=run_dir.name, sample=cfg.sample, step=s.index + 1, block=s.block, kind=s.kind,
                         axis=s.axis, lens_start_um=lens0, stage_start_um=stage0, pd_gain_db=cfg.pd_gain_db,
+                        pd_gain_h_db=cfg.pd_gain_h_db, pd_gain_v_db=cfg.pd_gain_v_db,
                         fp_mod_hz=cfg.fp_mod_hz, fs_hz=s.fs_hz, fp_alias_hz=alias_hz(cfg.fp_mod_hz, s.fs_hz) if s.fs_hz else None)
             row = dict(step=s.index + 1, block=s.block, kind=s.kind, axis=s.axis, direction=s.direction,
                        speed_um_s=s.speed_um_s, fs_hz=s.fs_hz, t_perf=time.perf_counter(), status="ok",
